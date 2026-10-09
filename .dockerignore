@@ -1,0 +1,32 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# FreeCAD addon (not needed in container — runs on host)
+freecad_addon/
+
+# Examples (not needed in container)
+examples/
+
+# Skills (not needed in container)
+skills/
+
+# Docs
+README.md
+LICENSE
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+Dockerfile
+.dockerignore

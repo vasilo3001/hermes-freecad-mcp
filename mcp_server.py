@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Hermes FreeCAD MCP — MCP Server
-================================
+Hermes FreeCAD MCP — MCP Server (MCP SDK 2.0)
+==============================================
 mcp_server.py — MCP server that Hermes Agent connects to via stdio.
 
 This server:
@@ -17,7 +17,6 @@ Hermes config:
       args: ["/path/to/mcp_server.py"]
 """
 
-import asyncio
 import json
 import socket
 import sys
@@ -27,7 +26,6 @@ import os
 try:
     from mcp.server import Server
     from mcp.server.stdio import stdio_server
-    from mcp.server.models import InitializationOptions
     import mcp.types as types
 except ImportError:
     print("ERROR: mcp package not installed. Run: pip install mcp", file=sys.stderr)
@@ -101,16 +99,14 @@ client = FreeCADClient()
 
 
 def _tool(name, description, properties, required=None):
-    """Helper to build an MCP Tool definition."""
+    """Helper to build an MCP Tool definition (SDK 2.0)."""
     schema = {"type": "object", "properties": properties}
     if required:
         schema["required"] = required
-    return types.Tool(name=name, description=description, inputSchema=schema)
+    return types.Tool(name=name, description=description, input_schema=schema)
 
 
 # ── Tool Definitions ─────────────────────────────────
-# These are the tools that Hermes Agent will see and can call.
-
 def get_all_tools():
     """Return the full list of MCP tools."""
     return [
@@ -470,16 +466,18 @@ def get_all_tools():
     ]
 
 
-# ── MCP Handlers ─────────────────────────────────────
+# ── MCP Handlers (SDK 2.0) ───────────────────────────
 
-@server.list_tools()
-async def handle_list_tools() -> list[types.Tool]:
-    return get_all_tools()
+async def handle_list_tools(context, params):
+    """Handle tools/list — return all available tools."""
+    return types.ListToolsResult(tools=get_all_tools())
 
 
-@server.call_tool()
-async def handle_call_tool(name: str, arguments: dict) -> list[types.TextContent]:
-    """Handle a tool call from the Hermes Agent."""
+async def handle_call_tool(context, params):
+    """Handle tools/call — forward to FreeCAD via TCP."""
+    name = params.name
+    arguments = params.arguments or {}
+
     # Strip the 'freecad_' prefix to get the FreeCAD tool name
     fc_tool = name
     if fc_tool.startswith("freecad_"):
@@ -489,22 +487,32 @@ async def handle_call_tool(name: str, arguments: dict) -> list[types.TextContent
     if fc_tool == "ping":
         response = client.send_command("ping", {}, timeout=5.0)
         if "error" in response:
-            return [types.TextContent(type="text", text=json.dumps(response))]
-        return [types.TextContent(type="text", text=json.dumps(response.get("result", response)))]
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=json.dumps(response))],
+                is_error=True,
+            )
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=json.dumps(response.get("result", response)))]
+        )
 
     # Special case: get_status
     if fc_tool == "get_status":
         response = client.send_command("ping", {}, timeout=5.0)
         if "error" in response:
-            return [types.TextContent(type="text", text=json.dumps({
-                "status": "OFFLINE",
-                "detail": response["error"],
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=json.dumps({
+                    "status": "OFFLINE",
+                    "detail": response["error"],
+                }))],
+                is_error=True,
+            )
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=json.dumps({
+                "status": "ONLINE",
+                "host": FREECAD_HOST,
+                "port": FREECAD_PORT,
             }))]
-        return [types.TextContent(type="text", text=json.dumps({
-            "status": "ONLINE",
-            "host": FREECAD_HOST,
-            "port": FREECAD_PORT,
-        }))]
+        )
 
     # Forward to FreeCAD
     timeout = 60.0
@@ -518,11 +526,21 @@ async def handle_call_tool(name: str, arguments: dict) -> list[types.TextContent
         text = json.dumps({"error": response["error"]})
         if "traceback" in response:
             text += "\n\nTraceback:\n" + response["traceback"]
-    else:
-        result = response.get("result", response)
-        text = json.dumps(result, indent=2)
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=text)],
+            is_error=True,
+        )
 
-    return [types.TextContent(type="text", text=text)]
+    result = response.get("result", response)
+    text = json.dumps(result, indent=2)
+    return types.CallToolResult(
+        content=[types.TextContent(type="text", text=text)]
+    )
+
+
+# ── Register handlers ────────────────────────────────
+server.add_request_handler("tools/list", types.PaginatedRequestParams, handle_list_tools)
+server.add_request_handler("tools/call", types.CallToolRequestParams, handle_call_tool)
 
 
 # ── Main ─────────────────────────────────────────────
@@ -532,16 +550,10 @@ async def main():
         await server.run(
             read_stream,
             write_stream,
-            InitializationOptions(
-                server_name=SERVER_NAME,
-                server_version=SERVER_VERSION,
-                capabilities=server.get_capabilities(
-                    notification_options=None,
-                    experimental_capabilities={},
-                ),
-            ),
+            server.create_initialization_options(),
         )
 
 
 if __name__ == "__main__":
+    import asyncio
     asyncio.run(main())

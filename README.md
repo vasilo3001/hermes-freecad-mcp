@@ -71,6 +71,8 @@ pip install mcp
 
 ### 4. Configure Hermes Agent
 
+**Option A: Native Python** (simplest, same machine as FreeCAD)
+
 Add to `~/.hermes/config.yaml`:
 
 ```yaml
@@ -81,7 +83,50 @@ mcp_servers:
     timeout: 120
 ```
 
-Replace `/absolute/path/to/mcp_server.py` with the actual path.
+**Option B: Docker** (isolated, same pattern as Kagi MCP on aibox)
+
+Build the image:
+
+```bash
+docker build -t freecad-mcp .
+```
+
+Add to `~/.hermes/config.yaml`:
+
+```yaml
+mcp_servers:
+  freecad:
+    command: "docker"
+    args:
+      - "run"
+      - "--rm"
+      - "-i"
+      - "--add-host=host.docker.internal:host-gateway"
+      - "-e"
+      - "FREECAD_HOST=host.docker.internal"
+      - "freecad-mcp"
+    timeout: 120
+```
+
+> **Note:** `--add-host=host.docker.internal:host-gateway` is required on
+> Linux so the container can reach FreeCAD on the host. On Docker Desktop
+> (macOS/Windows), `host.docker.internal` works out of the box.
+
+**How it works (Docker):**
+
+```
+Hermes Agent
+  │ stdio (JSON-RPC)
+  ▼
+docker run --rm -i freecad-mcp
+  │ TCP (host.docker.internal:9876)
+  ▼
+FreeCAD Addon (host)
+```
+
+Hermes spawns the container per-session (same as Kagi MCP). The container
+runs `mcp_server.py`, which connects to FreeCAD on the host via
+`host.docker.internal:9876`. When the session ends, `--rm` cleans up.
 
 ### 5. Start FreeCAD and Activate the Bridge
 
@@ -259,7 +304,7 @@ non-destructive.
 
 ## Roadmap
 
-- [ ] Docker containerized FreeCAD (headless with VNC)
+- [x] Docker containerized MCP server (stdio, same pattern as Kagi MCP)
 - [ ] PartDesign workbench integration (pads, pockets, holes with proper constraints)
 - [ ] Sketcher constraint solving
 - [ ] TechDraw automated drawings
