@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# FreeCAD
+*.FCStd
+*.FCStd1
+*.FCStd2
+
+# Exports (generated)
+*.stl
+*.step
+*.3mf
+*.obj
+*.gcode
+
+# Environment
+.env
+.venv/
+venv/
