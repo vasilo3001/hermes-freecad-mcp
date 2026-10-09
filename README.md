@@ -223,9 +223,28 @@ freecadMCP vibecoding/
 ├── examples/
 │   ├── drone_mount_bracket.py   ← Example: FPV drone camera mount
 │   └── test_basic.py            ← Smoke test
-├── install.sh                   ← One-command installer
+├── install.sh                   ← One-command installer (see below)
 └── requirements.txt             ← Python dependencies
 ```
+
+### What `install.sh` does
+
+```
+1. Detects OS (Linux / macOS)
+2. Finds FreeCAD:
+   • System install (freecad in PATH)
+   • Flatpak (flatpak list | grep freecad)
+   • Data dir (~/.local/share/FreeCAD)
+3. Checks Python 3 + installs 'mcp' pip package if missing
+4. Copies freecad_addon/hermes_freecad_mcp/ → FreeCAD Mod directory:
+   • Linux:   ~/.local/share/FreeCAD/Mod/
+   • macOS:   ~/Library/Application Support/FreeCAD/Mod/
+5. Prints the Hermes config.yaml snippet to add
+```
+
+It does NOT modify `config.yaml` automatically — it prints the snippet
+so you can add it yourself (or paste it). This keeps the installer
+non-destructive.
 
 ## Troubleshooting
 
@@ -246,8 +265,8 @@ freecadMCP vibecoding/
 - [ ] TechDraw automated drawings
 - [ ] FEM analysis hooks
 - [ ] Multi-document support
-- [ ] Windows support (TCP instead of Unix socket)
-- [ ] WebSocket transport (for remote FreeCAD)
+- [ ] Windows support (addon Mod path + install script)
+- [ ] WebSocket transport (for remote FreeCAD over LAN)
 
 ## Credits
 
