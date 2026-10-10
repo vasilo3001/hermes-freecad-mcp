@@ -28,7 +28,7 @@ import Part
 from PySide import QtCore
 
 MCP_BRIDGE_PORT = 9876
-HOST = "127.0.0.1"
+HOST = "0.0.0.0"  # Listen on all interfaces (allows remote MCP server)
 _req_counter = itertools.count(1)
 
 
