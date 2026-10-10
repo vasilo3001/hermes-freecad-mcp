@@ -1,13 +1,18 @@
-# FreeCAD MCP Server - Portainer Stack
-# Runs in HTTP (streamable) mode — persistent, multi-agent access
+# FreeCAD MCP Server - Portainer Stack (Docker Hub pull)
 #
-# BEFORE DEPLOYING:
-#   1. Clone this repo on the homeserver:
-#      git clone git@github.com:vasilo3001/hermes-freecad-mcp.git /DATA/AppData/hermes-freecad-mcp
-#   2. In Portainer: Stacks → Add stack → Name: freecad-mcp
-#      → Paste the YAML below (or point to the cloned repo)
-#   3. Make sure FreeCAD is running on the homeserver with
-#      the Hermes MCP workbench active (bridge on port 9876)
+# No build step — pulls the pre-built image from Docker Hub.
+#
+# Deploy:
+#   Portainer → Stacks → Add stack → Name: freecad-mcp → paste this YAML
+#
+# Updates:
+#   I push a new tag (e.g. v1.1) to Docker Hub.
+#   Bump the image tag below and redeploy the stack.
+#
+# Requires:
+#   - FreeCAD running on the desktop (192.168.1.177)
+#     with the Hermes MCP workbench active (bridge on port 9876)
+#   - Port 9876 open on the desktop's firewall
 #
 # Hermes connects via HTTP:
 #   mcp_servers:
@@ -21,20 +26,15 @@
 
 services:
   freecadmcp:
-    build:
-      context: /DATA/AppData/hermes-freecad-mcp
-      dockerfile: Dockerfile
-    image: freecad-mcp:latest
+    image: vasilo30001/freecad-mcp:latest
     container_name: freecadmcp
     restart: unless-stopped
     ports:
       - "3111:8000"
     environment:
-      # FreeCAD bridge on the host (via host.docker.internal)
-      - FREECAD_HOST=host.docker.internal
+      # FreeCAD bridge on the desktop
+      - FREECAD_HOST=192.168.1.177
       - FREECAD_PORT=9876
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     networks:
       - homeserver_homeserver-net
 
