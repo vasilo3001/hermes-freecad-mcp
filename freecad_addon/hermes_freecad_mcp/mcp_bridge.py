@@ -763,18 +763,23 @@ class MCPBridgeServer:
             )
 
         elif ctype.lower() in ("distance", "distance_x", "distance_y"):
-            # Distance between two points: p1=[geoId,posId], p2=[geoId,posId]
+            # Distance: p1=[geoId,posId], optional p2=[geoId,posId]
             if value is None:
                 raise ValueError("%s requires a value" % ctype)
-            if not p1 or not p2:
-                raise ValueError(
-                    "%s requires p1 and p2 as [geoId, posId] pairs" % ctype
-                )
+            if not p1:
+                raise ValueError("%s requires p1 as [geoId, posId]" % ctype)
             g1, pos1v = p1
-            g2, pos2v = p2
-            c = Sketcher.Constraint(
-                type_name, int(g1), int(pos1v), int(g2), int(pos2v), float(value)
-            )
+            if p2:
+                # Two-point distance
+                g2, pos2v = p2
+                c = Sketcher.Constraint(
+                    type_name, int(g1), int(pos1v), int(g2), int(pos2v), float(value)
+                )
+            else:
+                # Single-point distance from origin
+                c = Sketcher.Constraint(
+                    type_name, int(g1), int(pos1v), float(value)
+                )
 
         elif ctype.lower() in ("radius", "diameter"):
             # Single geometry: geo1
