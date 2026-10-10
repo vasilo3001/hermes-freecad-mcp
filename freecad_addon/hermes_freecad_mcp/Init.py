@@ -12,7 +12,13 @@ import os
 import sys
 
 # Add the addon directory to sys.path so submodules can be imported
-_addon_dir = os.path.dirname(os.path.abspath(__file__))
+_addon_dir = os.path.expanduser(
+    "~/.var/app/org.freecad.FreeCAD/data/FreeCAD/v1-1/Mod/hermes_freecad_mcp"
+)
+if not os.path.isdir(_addon_dir):
+    _addon_dir = os.path.expanduser(
+        "~/.local/share/FreeCAD/Mod/hermes_freecad_mcp"
+    )
 if _addon_dir not in sys.path:
     sys.path.insert(0, _addon_dir)
 

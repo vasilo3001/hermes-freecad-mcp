@@ -7,6 +7,9 @@ Receives JSON commands from the MCP server (via localhost TCP) and
 executes them in the FreeCAD context. All geometry operations happen
 here, so the user sees everything live in the FreeCAD 3D viewport.
 
+Thread safety: FreeCAD's Python API is NOT thread-safe. All FreeCAD
+calls are marshalled to the main (GUI) thread via Qt's event loop.
+
 Protocol: newline-delimited JSON over TCP.
   Request:  {"id": 1, "tool": "create_box", "args": {...}}\n
   Response: {"id": 1, "result": {...}}\n
@@ -17,12 +20,69 @@ import socket
 import threading
 import traceback
 import time
+import itertools
 
 import FreeCAD
 import Part
+from PySide import QtCore
 
 MCP_BRIDGE_PORT = 9876
 HOST = "127.0.0.1"
+_req_counter = itertools.count(1)
+
+
+class _MainThreadDispatcher(QtCore.QObject):
+    """QObject that lives on the main thread and executes FreeCAD calls."""
+
+    def __init__(self):
+        super().__init__()
+        self._results = {}
+        self._lock = threading.Lock()
+        self._pending = {}
+
+    def execute_on_main(self, func, args, kwargs, req_id):
+        """Schedule func to run on the main thread, store result by req_id."""
+        with self._lock:
+            self._pending[req_id] = (func, args, kwargs)
+
+        # Use QMetaObject to safely invoke on main thread
+        QtCore.QMetaObject.invokeMethod(
+            self,
+            "_execute_pending",
+            QtCore.Qt.QueuedConnection,
+            QtCore.Q_ARG("int", req_id),
+        )
+
+    def _execute_pending(self, req_id):
+        """Slot: execute the pending function on the main thread."""
+        with self._lock:
+            if req_id not in self._pending:
+                return
+            func, args, kwargs = self._pending.pop(req_id)
+
+        try:
+            result = func(*args, **kwargs)
+            with self._lock:
+                self._results[req_id] = {"result": result}
+        except Exception as e:
+            with self._lock:
+                self._results[req_id] = {
+                    "error": "%s: %s" % (type(e).__name__, str(e)),
+                    "traceback": traceback.format_exc(),
+                }
+
+    # Qt slot decorator
+    _execute_pending = QtCore.Slot("int")(_execute_pending)
+
+    def get_result(self, req_id, timeout=60.0):
+        """Wait for the result of a scheduled execution."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self._lock:
+                if req_id in self._results:
+                    return self._results.pop(req_id)
+            time.sleep(0.01)
+        raise TimeoutError("FreeCAD command timed out after %.0fs" % timeout)
 
 
 class MCPBridgeServer:
@@ -36,7 +96,8 @@ class MCPBridgeServer:
         self.thread = None
         self.connection_count = 0
         self.last_command_time = None
-        self.command_log = []  # Last 50 commands for debugging
+        self.command_log = []
+        self._dispatcher = _MainThreadDispatcher()
 
     @property
     def is_running(self):
@@ -51,7 +112,7 @@ class MCPBridgeServer:
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server_socket.bind((self.host, self.port))
         self.server_socket.listen(5)
-        self.server_socket.settimeout(1.0)  # For clean shutdown
+        self.server_socket.settimeout(1.0)
 
         self.running = True
         self.thread = threading.Thread(target=self._accept_loop, daemon=True)
@@ -122,7 +183,6 @@ class MCPBridgeServer:
 
                 buffer += data
 
-                # Process complete lines
                 while b"\n" in buffer:
                     line, buffer = buffer.split(b"\n", 1)
                     line = line.strip()
@@ -143,7 +203,6 @@ class MCPBridgeServer:
                     tool = request.get("tool", "")
                     args = request.get("args", {})
 
-                    # Log the command
                     self.last_command_time = time.time()
                     self.command_log.append({
                         "time": time.ctime(),
@@ -158,8 +217,9 @@ class MCPBridgeServer:
                         % (tool, json.dumps(args)[:200])
                     )
 
+                    # Dispatch via main thread
                     try:
-                        result = self._dispatch(tool, args)
+                        result = self._dispatch_main(tool, args)
                         response = {"id": req_id, "result": result}
                     except Exception as e:
                         response = {
@@ -181,10 +241,9 @@ class MCPBridgeServer:
         data = json.dumps(response) + "\n"
         client.sendall(data.encode("utf-8"))
 
-    def _dispatch(self, tool, args):
-        """Route a tool call to the appropriate handler."""
+    def _dispatch_main(self, tool, args):
+        """Route a tool call, executing on the main thread."""
         handlers = {
-            # Document management
             "get_document_info": self._get_document_info,
             "new_document": self._new_document,
             "save_document": self._save_document,
@@ -194,8 +253,6 @@ class MCPBridgeServer:
             "delete_object": self._delete_object,
             "undo": self._undo,
             "redo": self._redo,
-
-            # Part primitives
             "create_box": self._create_box,
             "create_cylinder": self._create_cylinder,
             "create_sphere": self._create_sphere,
@@ -203,43 +260,29 @@ class MCPBridgeServer:
             "create_torus": self._create_torus,
             "create_wedge": self._create_wedge,
             "create_ellipse": self._create_ellipse,
-
-            # Boolean operations
             "fuse_objects": self._fuse_objects,
             "cut_objects": self._cut_objects,
             "common_objects": self._common_objects,
-
-            # Transformations
             "move_object": self._move_object,
             "rotate_object": self._rotate_object,
             "scale_object": self._scale_object,
             "mirror_object": self._mirror_object,
             "copy_object": self._copy_object,
-
-            # Dress-up
             "fillet_object": self._fillet_object,
             "chamfer_object": self._chamfer_object,
-
-            # Sketching
             "create_sketch": self._create_sketch,
             "add_sketch_line": self._add_sketch_line,
             "add_sketch_circle": self._add_sketch_circle,
             "add_sketch_arc": self._add_sketch_arc,
             "pad_sketch": self._pad_sketch,
             "extrude_sketch": self._extrude_sketch,
-
-            # Export
             "export_stl": self._export_stl,
             "export_step": self._export_step,
             "export_3mf": self._export_3mf,
             "export_svg": self._export_svg,
-
-            # View
             "fit_all": self._fit_all,
             "set_view": self._set_view,
             "screenshot": self._screenshot,
-
-            # Utility
             "run_python": self._run_python,
             "get_selection": self._get_selection,
             "ping": self._ping,
@@ -251,10 +294,21 @@ class MCPBridgeServer:
                 % (tool, ", ".join(sorted(handlers.keys())))
             )
 
-        return handlers[tool](**args)
+        handler = handlers[tool]
+        timeout = 120.0 if tool == "run_python" else 60.0
+
+        # Execute on main thread
+        req_id = next(_req_counter)
+        self._dispatcher.execute_on_main(handler, (), args, req_id)
+        result = self._dispatcher.get_result(req_id, timeout=timeout)
+
+        if "error" in result:
+            raise RuntimeError(result["error"])
+
+        return result.get("result", result)
 
     # ──────────────────────────────────────────────
-    # Document management
+    # Handlers (all execute on main thread)
     # ──────────────────────────────────────────────
 
     def _get_document_info(self):
@@ -356,10 +410,6 @@ class MCPBridgeServer:
         FreeCAD.ActiveDocument.redo()
         return {"redone": True}
 
-    # ──────────────────────────────────────────────
-    # Part primitives
-    # ──────────────────────────────────────────────
-
     def _create_box(self, length=10, width=10, height=10, x=0, y=0, z=0, name=None):
         doc = self._ensure_doc()
         box = Part.makeBox(length, width, height)
@@ -422,7 +472,6 @@ class MCPBridgeServer:
 
     def _create_ellipse(self, major=10, minor=5, x=0, y=0, z=0, name=None):
         doc = self._ensure_doc()
-        # Create ellipse as a wire, then extrude to make it useful
         ellipse = Part.Ellipse(FreeCAD.Vector(x, y, z), major, minor)
         wire = Part.Wire(ellipse.toShape())
         obj = doc.addObject("Part::Feature", name or "Ellipse")
@@ -430,10 +479,6 @@ class MCPBridgeServer:
         obj.Label = name or "Ellipse %d" % (len(doc.Objects))
         doc.recompute()
         return self._object_result(obj)
-
-    # ──────────────────────────────────────────────
-    # Boolean operations
-    # ──────────────────────────────────────────────
 
     def _fuse_objects(self, objects, name=None):
         doc = self._ensure_doc()
@@ -485,10 +530,6 @@ class MCPBridgeServer:
         result.Label = name or "Common %d" % (len(doc.Objects))
         doc.recompute()
         return self._object_result(result)
-
-    # ──────────────────────────────────────────────
-    # Transformations
-    # ──────────────────────────────────────────────
 
     def _move_object(self, object_name, x=0, y=0, z=0):
         doc = self._ensure_doc()
@@ -560,10 +601,6 @@ class MCPBridgeServer:
         doc.recompute()
         return self._object_result(copy)
 
-    # ──────────────────────────────────────────────
-    # Dress-up
-    # ──────────────────────────────────────────────
-
     def _fillet_object(self, object_name, radius=1.0, edges=None, name=None):
         doc = self._ensure_doc()
         obj = doc.getObject(object_name)
@@ -571,7 +608,6 @@ class MCPBridgeServer:
             raise ValueError("Object not found: %s" % object_name)
         shape = obj.Shape
         if edges is None:
-            # Fillet all edges
             edge_list = shape.Edges
         else:
             edge_list = [shape.Edges[i] for i in edges]
@@ -599,19 +635,8 @@ class MCPBridgeServer:
         doc.recompute()
         return self._object_result(result)
 
-    # ──────────────────────────────────────────────
-    # Sketching
-    # ──────────────────────────────────────────────
-
     def _create_sketch(self, name=None, plane="XY"):
         doc = self._ensure_doc()
-        # Create a datum plane or use the base plane
-        plane_map = {
-            "XY": "XY_Plane",
-            "XZ": "XZ_Plane",
-            "YZ": "YZ_Plane",
-        }
-        # For simplicity, create a sketch on the active body or document
         sketch = doc.addObject("Sketcher::SketchObject", name or "Sketch")
         sketch.Label = name or "Sketch %d" % (len(doc.Objects))
         doc.recompute()
@@ -672,7 +697,6 @@ class MCPBridgeServer:
         sketch = doc.getObject(sketch_name)
         if not sketch:
             raise ValueError("Sketch not found: %s" % sketch_name)
-        # Extrude the sketch
         wire = sketch.Shape.Wires
         if not wire:
             raise ValueError("Sketch has no wires to extrude")
@@ -703,10 +727,6 @@ class MCPBridgeServer:
         result.Label = name or "Extrude %s" % sketch_name
         doc.recompute()
         return self._object_result(result)
-
-    # ──────────────────────────────────────────────
-    # Export
-    # ──────────────────────────────────────────────
 
     def _export_stl(self, path, objects=None, tolerance=0.1):
         doc = self._ensure_doc()
@@ -758,7 +778,6 @@ class MCPBridgeServer:
                 to_export.append(obj)
         else:
             to_export = doc.Objects
-        # 3MF export via Mesh
         import Mesh
         import MeshPart
         mesh = Mesh.Mesh()
@@ -774,10 +793,8 @@ class MCPBridgeServer:
         if direction is None:
             direction = [0, 0, 1]
         import TechDraw
-        # Create a TechDraw page for SVG export
         page = doc.addObject("TechDraw::DrawPage", "SvgPage")
         template = doc.addObject("TechDraw::DrawSVGTemplate", "SvgTemplate")
-        # Use a blank template
         import os
         template_dir = os.path.join(os.path.dirname(__file__), "templates")
         template.Template = os.path.join(template_dir, "A3_Landscape_blank.svg")
@@ -790,14 +807,9 @@ class MCPBridgeServer:
             view.Source = doc.Objects
         view.Direction = FreeCAD.Vector(*direction)
         doc.recompute()
-        # Export the page to SVG
         import TechDrawGui
         TechDrawGui.exportPageAsSvg(page, path)
         return {"exported": path, "format": "SVG"}
-
-    # ──────────────────────────────────────────────
-    # View
-    # ──────────────────────────────────────────────
 
     def _fit_all(self):
         import FreeCADGui as Gui
@@ -806,20 +818,6 @@ class MCPBridgeServer:
 
     def _set_view(self, view="isometric"):
         import FreeCADGui as Gui
-        view_map = {
-            "isometric": "ViewIsometric",
-            "front": "ViewFront",
-            "top": "ViewTop",
-            "right": "ViewRight",
-            "rear": "ViewRear",
-            "bottom": "ViewBottom",
-            "left": "ViewLeft",
-            "axono": "ViewAxonometric",
-        }
-        if view not in view_map:
-            raise ValueError("View must be one of: %s" % ", ".join(view_map.keys()))
-        Gui.activeDocument().activeView().viewIsometric() if view == "isometric" else None
-        # Use the proper view commands
         v = Gui.activeDocument().activeView()
         if view == "isometric":
             v.viewIsometric()
@@ -845,19 +843,10 @@ class MCPBridgeServer:
         if path is None:
             import tempfile
             path = os.path.join(tempfile.gettempdir(), "freecad_screenshot.png")
-        # Save the view as an image
         view.saveImage(path, width, height, "White")
         return {"screenshot": path, "width": width, "height": height}
 
-    # ──────────────────────────────────────────────
-    # Utility
-    # ──────────────────────────────────────────────
-
     def _run_python(self, code, timeout=30):
-        """Execute arbitrary Python code in the FreeCAD context.
-        This is the most powerful tool — the agent can write any
-        FreeCAD Python script and execute it here.
-        """
         namespace = {
             "FreeCAD": FreeCAD,
             "Part": Part,
@@ -870,7 +859,6 @@ class MCPBridgeServer:
         }
         try:
             exec(code, namespace)
-            # Try to capture a 'result' variable if the code set one
             result = namespace.get("result", None)
             return {
                 "executed": True,
@@ -886,7 +874,6 @@ class MCPBridgeServer:
             }
 
     def _get_selection(self):
-        """Return the current selection in the FreeCAD GUI."""
         import FreeCADGui as Gui
         sel = Gui.Selection.getSelection()
         return {
@@ -902,14 +889,12 @@ class MCPBridgeServer:
     # ──────────────────────────────────────────────
 
     def _ensure_doc(self):
-        """Return the active document, creating one if needed."""
         doc = FreeCAD.ActiveDocument
         if not doc:
             doc = FreeCAD.newDocument("Document")
         return doc
 
     def _object_result(self, obj):
-        """Build a standard result dict for a created/modified object."""
         result = {
             "name": obj.Name,
             "label": obj.Label,
