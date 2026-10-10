@@ -15,7 +15,7 @@ live in the FreeCAD 3D viewport.
 │                      │ stdio (JSON-RPC 2.0)                  │
 │  ┌───────────────────▼────────────────────────────────────┐  │
 │  │  mcp_server.py  (MCP Server — Python)                  │  │
-│  │  • Registers 35 tools for Hermes                       │  │
+│  │  • Registers 38 tools for Hermes                       │  │
 │  │  • Forwards commands to FreeCAD addon                  │  │
 │  └───────────────────┬────────────────────────────────────┘  │
 │                      │ TCP localhost:9876 (newline JSON)     │
@@ -132,8 +132,7 @@ runs `mcp_server.py`, which connects to FreeCAD on the host via
 
 1. Launch FreeCAD
 2. Switch to the **Hermes MCP** workbench (workbench dropdown, top-right)
-3. Click **Start Bridge** in the toolbar
-4. You should see in the FreeCAD console:
+3. The bridge **auto-starts** on workbench activation. You should see in the FreeCAD console:
    ```
    [HermesFreeCADMCP] Bridge started on port 9876. Hermes Agent can now connect.
    ```
@@ -142,7 +141,7 @@ runs `mcp_server.py`, which connects to FreeCAD on the host via
 
 Restart Hermes so it picks up the new MCP server. On startup it will:
 - Connect to `mcp_server.py` via stdio
-- Discover all 35 FreeCAD tools
+- Discover all 38 FreeCAD tools
 - Register them as `mcp_freecad_*` tools
 
 ## Usage
@@ -175,7 +174,7 @@ Hermes: [writes FreeCAD Python script, calls mcp_freecad_run_python]
         → Hex bolt created with 6mm across-flats, 20mm length
 ```
 
-## Available Tools (35)
+## Available Tools (38)
 
 ### Connection
 | Tool | Description |
@@ -263,12 +262,19 @@ freecadMCP vibecoding/
 ├── freecad_addon/
 │   └── hermes_freecad_mcp/      ← FreeCAD addon (copy to Mod dir)
 │       ├── Init.py              ← Addon entry point
-│       ├── InitGui.py           ← Workbench + toolbar commands
-│       └── mcp_bridge.py        ← TCP server + command dispatcher
+│       ├── InitGui.py           ← Workbench (bridge auto-starts on activation)
+│       └── mcp_bridge.py        ← TCP server + thread-safe command dispatcher
 ├── examples/
-│   ├── drone_mount_bracket.py   ← Example: FPV drone camera mount
-│   └── test_basic.py            ← Smoke test
+│   └── drone_mount_bracket.py   ← Example: FPV drone camera mount
+├── skills/
+│   └── freecad-modeling/
+│       └── SKILL.md             ← Hermes skill (workflow guide)
+├── test_bridge.py               ← Direct TCP test (run against live bridge)
 ├── install.sh                   ← One-command installer (see below)
+├── Dockerfile                   ← Docker image for MCP server
+├── .dockerignore
+├── plugin.json                  ← Hermes Portable Agent Plugin manifest
+├── mcp.json                     ← MCP server config (plugin)
 └── requirements.txt             ← Python dependencies
 ```
 

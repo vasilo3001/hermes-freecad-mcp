@@ -17,12 +17,12 @@ running with the **Hermes MCP** workbench bridge started (TCP port 9876).
 ## Prerequisites
 
 1. FreeCAD is running (GUI mode)
-2. Hermes MCP workbench is active and **Start Bridge** was clicked
+2. Hermes MCP workbench is active (bridge auto-starts on activation)
 3. `mcp_freecad_ping` returns `true`
 
 If ping fails, tell the user to check:
 - FreeCAD is open
-- Hermes MCP workbench → Start Bridge
+- Hermes MCP workbench is selected (bridge starts automatically)
 - Port 9876 is not blocked
 
 ## Workflow
