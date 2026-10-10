@@ -83,7 +83,7 @@ mcp_servers:
     timeout: 120
 ```
 
-**Option B: Docker** (isolated, same pattern as Kagi MCP on aibox)
+**Option B: Docker** (isolated container)
 
 Build the image:
 
@@ -124,7 +124,7 @@ docker run --rm -i freecad-mcp
 FreeCAD Addon (host)
 ```
 
-Hermes spawns the container per-session (same as Kagi MCP). The container
+Hermes spawns the container per-session. The container
 runs `mcp_server.py`, which connects to FreeCAD on the host via
 `host.docker.internal:9876`. When the session ends, `--rm` cleans up.
 
@@ -304,7 +304,7 @@ non-destructive.
 
 ## Roadmap
 
-- [x] Docker containerized MCP server (stdio, same pattern as Kagi MCP)
+- [x] Docker containerized MCP server (stdio)
 - [ ] PartDesign workbench integration (pads, pockets, holes with proper constraints)
 - [ ] Sketcher constraint solving
 - [ ] TechDraw automated drawings

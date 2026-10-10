@@ -23,5 +23,5 @@ USER mcp
 ENV FREECAD_HOST=host.docker.internal
 ENV FREECAD_PORT=9876
 
-# MCP stdio transport (same as Kagi MCP pattern)
+# MCP stdio transport
 ENTRYPOINT ["python3", "mcp_server.py"]
