@@ -16,6 +16,7 @@ Protocol: newline-delimited JSON over TCP.
 """
 
 import json
+import os
 import socket
 import threading
 import traceback
@@ -274,6 +275,9 @@ class MCPBridgeServer:
             "add_sketch_line": self._add_sketch_line,
             "add_sketch_circle": self._add_sketch_circle,
             "add_sketch_arc": self._add_sketch_arc,
+            "add_constraint": self._add_constraint,
+            "get_sketch_info": self._get_sketch_info,
+            "solve_sketch": self._solve_sketch,
             "pad_sketch": self._pad_sketch,
             "extrude_sketch": self._extrude_sketch,
             "export_stl": self._export_stl,
@@ -374,7 +378,7 @@ class MCPBridgeServer:
             "label": obj.Label,
             "type": obj.TypeId,
         }
-        if hasattr(obj, "Shape") and obj.Shape:
+        if hasattr(obj, "Shape") and obj.Shape and not obj.Shape.isNull():
             shape = obj.Shape
             bbox = shape.BoundBox
             info["bbox"] = {
@@ -692,6 +696,242 @@ class MCPBridgeServer:
         doc.recompute()
         return {"added": "arc", "sketch": sketch_name}
 
+    # ── Constraint types (name → Sketcher.Constraint enum) ──
+    _CONSTRAINT_MAP = {
+        "coincident": "Coincident",
+        "point_on_line": "PointOnLine",
+        "distance": "Distance",
+        "distance_x": "DistanceX",
+        "distance_y": "DistanceY",
+        "horizontal": "Horizontal",
+        "vertical": "Vertical",
+        "parallel": "Parallel",
+        "perpendicular": "Perpendicular",
+        "tangent": "Tangent",
+        "equal": "Equal",
+        "symmetric": "Symmetric",
+        "angle": "Angle",
+        "radius": "Radius",
+        "diameter": "Diameter",
+        "fixed": "Fixed",
+        "block": "Block",
+    }
+
+    def _add_constraint(self, sketch_name, ctype, p1=None, p2=None,
+                        value=None, geo1=None, geo2=None,
+                        pos1=None, pos2=None):
+        """Add a constraint to a sketch.
+
+        Args:
+            sketch_name: Name of the sketch object
+            ctype: Constraint type (coincident, distance, horizontal, etc.)
+            p1, p2: Point refs as [geoId, posId] for coincident/point_on_line
+            geo1, geo2: Geometry IDs for line-based constraints
+            pos1, pos2: Point positions on geo1/geo2 (1=start, 2=end, 3=center)
+            value: Numeric value (distance, angle in degrees, radius, etc.)
+        """
+        doc = self._ensure_doc()
+        sketch = doc.getObject(sketch_name)
+        if not sketch:
+            raise ValueError("Sketch not found: %s" % sketch_name)
+
+        import Sketcher
+
+        type_name = self._CONSTRAINT_MAP.get(ctype.lower())
+        if not type_name:
+            raise ValueError(
+                "Unknown constraint type: '%s'. Available: %s"
+                % (ctype, ", ".join(sorted(self._CONSTRAINT_MAP.keys())))
+            )
+
+        geo_count = sketch.GeometryCount
+
+        if ctype.lower() in ("coincident", "point_on_line"):
+            # Point-to-point: p1=[geoId, posId], p2=[geoId, posId]
+            if not p1 or not p2:
+                raise ValueError(
+                    "%s requires p1 and p2 as [geoId, posId] pairs" % ctype
+                )
+            g1, pos1v = p1
+            g2, pos2v = p2
+            if g1 >= geo_count or g2 >= geo_count:
+                raise ValueError(
+                    "Geometry ID out of range (0-%d)" % (geo_count - 1)
+                )
+            c = Sketcher.Constraint(
+                type_name, int(g1), int(pos1v), int(g2), int(pos2v)
+            )
+
+        elif ctype.lower() in ("distance", "distance_x", "distance_y"):
+            # Distance between two points: p1=[geoId,posId], p2=[geoId,posId]
+            if value is None:
+                raise ValueError("%s requires a value" % ctype)
+            if not p1 or not p2:
+                raise ValueError(
+                    "%s requires p1 and p2 as [geoId, posId] pairs" % ctype
+                )
+            g1, pos1v = p1
+            g2, pos2v = p2
+            c = Sketcher.Constraint(
+                type_name, int(g1), int(pos1v), int(g2), int(pos2v), float(value)
+            )
+
+        elif ctype.lower() in ("radius", "diameter"):
+            # Single geometry: geo1
+            if value is None:
+                raise ValueError("%s requires a value" % ctype)
+            if geo1 is None:
+                raise ValueError("%s requires geo1" % ctype)
+            if geo1 >= geo_count:
+                raise ValueError("Geometry ID out of range (0-%d)" % (geo_count - 1))
+            c = Sketcher.Constraint(type_name, int(geo1), float(value))
+
+        elif ctype.lower() == "angle":
+            # Angle between two lines: geo1, geo2
+            if value is None:
+                raise ValueError("angle requires a value (degrees)")
+            if geo1 is None or geo2 is None:
+                raise ValueError("angle requires geo1 and geo2")
+            c = Sketcher.Constraint(type_name, int(geo1), int(geo2), float(value))
+
+        elif ctype.lower() in ("horizontal", "vertical", "fixed", "block"):
+            # Single geometry: geo1
+            if geo1 is None:
+                raise ValueError("%s requires geo1" % ctype)
+            if geo1 >= geo_count:
+                raise ValueError("Geometry ID out of range (0-%d)" % (geo_count - 1))
+            c = Sketcher.Constraint(type_name, int(geo1))
+
+        elif ctype.lower() in ("parallel", "perpendicular", "tangent", "equal"):
+            # Two geometries: geo1, geo2
+            if geo1 is None or geo2 is None:
+                raise ValueError("%s requires geo1 and geo2" % ctype)
+            if geo1 >= geo_count or geo2 >= geo_count:
+                raise ValueError("Geometry ID out of range (0-%d)" % (geo_count - 1))
+            c = Sketcher.Constraint(type_name, int(geo1), int(geo2))
+
+        elif ctype.lower() == "symmetric":
+            # p1, p2, and geo1 (axis of symmetry)
+            if not p1 or not p2 or geo1 is None:
+                raise ValueError(
+                    "symmetric requires p1, p2 as [geoId,posId] and geo1 (axis)"
+                )
+            g1, pos1v = p1
+            g2, pos2v = p2
+            c = Sketcher.Constraint(
+                type_name, int(g1), int(pos1v), int(g2), int(pos2v), int(geo1)
+            )
+
+        else:
+            raise ValueError("Unhandled constraint type: %s" % ctype)
+
+        sketch.addConstraint(c)
+        doc.recompute()
+
+        # Report constraint status
+        dof = sketch.solve()
+        info = self._sketch_status(sketch)
+        info["constraint_added"] = ctype
+        info["constraint_count"] = len(sketch.Constraints)
+        return info
+
+    def _sketch_status(self, sketch):
+        """Return DoF and constraint status for a sketch."""
+        sketch.solve()
+        geo_count = sketch.GeometryCount
+        con_count = len(sketch.Constraints)
+        # Compute DoF: each line = 4 DoF, each circle = 3 DoF
+        # Each constraint removes DoF (most remove 1, coincident removes 2, fixed removes all)
+        total_dof = 0
+        for i in range(geo_count):
+            try:
+                g = sketch.getGeometry(i)
+                gtype = type(g).__name__
+                if gtype == "LineSegment":
+                    total_dof += 4
+                elif gtype == "Circle":
+                    total_dof += 3
+                elif gtype in ("ArcOfCircle", "Arc"):
+                    total_dof += 5
+                else:
+                    total_dof += 4  # default
+            except Exception:
+                total_dof += 4
+
+        # Subtract DoF removed by constraints
+        removed = 0
+        for c in sketch.Constraints:
+            ctype = str(getattr(c, "Type", ""))
+            if ctype in ("Coincident", "PointOnLine"):
+                removed += 2
+            elif ctype in ("Fixed", "Block"):
+                # Fixed removes all DoF of the geometry
+                try:
+                    g = sketch.getGeometry(c.First)
+                    gtype = type(g).__name__
+                    if gtype == "LineSegment":
+                        removed += 4
+                    elif gtype == "Circle":
+                        removed += 3
+                    else:
+                        removed += 4
+                except Exception:
+                    removed += 4
+            elif ctype in ("Horizontal", "Vertical"):
+                removed += 1
+            else:
+                removed += 1  # most constraints remove 1 DoF
+
+        dof = max(0, total_dof - removed)
+        fully_constrained = (dof == 0)
+        return {
+            "geometry_count": geo_count,
+            "constraint_count": con_count,
+            "dof": dof,
+            "fully_constrained": fully_constrained,
+            "status": "FULLY CONSTRAINED (green)" if fully_constrained
+                      else "UNDER-CONSTRAINED (blue, %d DoF remaining)" % dof,
+        }
+
+    def _get_sketch_info(self, sketch_name):
+        """Get detailed info about a sketch: geometry, constraints, DoF."""
+        doc = self._ensure_doc()
+        sketch = doc.getObject(sketch_name)
+        if not sketch:
+            raise ValueError("Sketch not found: %s" % sketch_name)
+
+        import Sketcher
+
+        geo_types = []
+        for i in range(sketch.GeometryCount):
+            try:
+                g = sketch.getGeometry(i)
+                geo_types.append(type(g).__name__)
+            except Exception:
+                geo_types.append("unknown")
+
+        constraints = []
+        for c in sketch.Constraints:
+            ctype = type(c).__name__
+            constraints.append({
+                "type": ctype,
+                "value": getattr(c, "Value", None),
+            })
+
+        status = self._sketch_status(sketch)
+        status["geometry_types"] = geo_types
+        status["constraints"] = constraints
+        return status
+
+    def _solve_sketch(self, sketch_name):
+        """Force the solver to run and report the result."""
+        doc = self._ensure_doc()
+        sketch = doc.getObject(sketch_name)
+        if not sketch:
+            raise ValueError("Sketch not found: %s" % sketch_name)
+        doc.recompute()
+        return self._sketch_status(sketch)
+
     def _pad_sketch(self, sketch_name, length=10, name=None):
         doc = self._ensure_doc()
         sketch = doc.getObject(sketch_name)
@@ -743,7 +983,7 @@ class MCPBridgeServer:
         import MeshPart
         mesh = Mesh.Mesh()
         for obj in to_export:
-            if hasattr(obj, "Shape") and obj.Shape:
+            if hasattr(obj, "Shape") and obj.Shape and not obj.Shape.isNull():
                 m = MeshPart.meshFromShape(
                     Shape=obj.Shape,
                     LinearDeflection=tolerance,
@@ -782,7 +1022,7 @@ class MCPBridgeServer:
         import MeshPart
         mesh = Mesh.Mesh()
         for obj in to_export:
-            if hasattr(obj, "Shape") and obj.Shape:
+            if hasattr(obj, "Shape") and obj.Shape and not obj.Shape.isNull():
                 m = MeshPart.meshFromShape(Shape=obj.Shape, LinearDeflection=0.1)
                 mesh.addMesh(m)
         mesh.write(path)
@@ -900,7 +1140,7 @@ class MCPBridgeServer:
             "label": obj.Label,
             "type": obj.TypeId,
         }
-        if hasattr(obj, "Shape") and obj.Shape:
+        if hasattr(obj, "Shape") and obj.Shape and not obj.Shape.isNull():
             bbox = obj.Shape.BoundBox
             result["bbox"] = {
                 "x": [bbox.XMin, bbox.XMax],

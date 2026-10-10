@@ -1,34 +1,44 @@
 #!/usr/bin/env python3
 """
-Hermes FreeCAD MCP — MCP Server (MCP SDK 2.0)
+Hermes FreeCAD MCP — MCP Server (MCP SDK 2.x)
 ==============================================
-mcp_server.py — MCP server that Hermes Agent connects to via stdio.
+mcp_server.py — MCP server that bridges Hermes Agent to FreeCAD.
 
-This server:
-  1. Registers ~35 MCP tools for the Hermes Agent
-  2. Forwards tool calls to the FreeCAD addon via TCP (localhost:9876)
-  3. Returns results back to Hermes
+Supports two transports:
+  1. stdio  — for local Hermes (per-session, spawned by Hermes)
+  2. HTTP   — for persistent deployment on homeserver (Portainer stack)
 
-Run this with:  python3 mcp_server.py
-Hermes config:
-  mcp_servers:
-    freecad:
-      command: "python3"
-      args: ["/path/to/mcp_server.py"]
+HTTP mode (recommended for multi-agent / Tailscale):
+  python3 mcp_server.py --http --port 8000
+  # Hermes config:
+  #   mcp_servers:
+  #     freecad:
+  #       url: "http://192.168.1.184:3111/mcp"
+
+stdio mode (local, single agent):
+  python3 mcp_server.py
+  # Hermes config:
+  #   mcp_servers:
+  #     freecad:
+  #       command: "python3"
+  #       args: ["/path/to/mcp_server.py"]
+
+Environment variables:
+  FREECAD_HOST  — FreeCAD bridge host (default: 127.0.0.1, use host.docker.internal in Docker)
+  FREECAD_PORT  — FreeCAD bridge port (default: 9876)
 """
 
 import json
 import socket
 import sys
 import os
+import argparse
 
 # ── MCP SDK ──────────────────────────────────────────
 try:
-    from mcp.server import Server
-    from mcp.server.stdio import stdio_server
-    import mcp.types as types
+    from mcp.server.mcpserver import MCPServer
 except ImportError:
-    print("ERROR: mcp package not installed. Run: pip install mcp", file=sys.stderr)
+    print("ERROR: mcp package not installed (v2.x). Run: pip install 'mcp>=2.0.0'", file=sys.stderr)
     sys.exit(1)
 
 # ── Configuration ────────────────────────────────────
@@ -36,6 +46,7 @@ FREECAD_HOST = os.environ.get("FREECAD_HOST", "127.0.0.1")
 FREECAD_PORT = int(os.environ.get("FREECAD_PORT", "9876"))
 SERVER_NAME = "freecad"
 SERVER_VERSION = "1.0.0"
+
 
 # ── TCP Client ───────────────────────────────────────
 class FreeCADClient:
@@ -94,466 +105,522 @@ class FreeCADClient:
 
 
 # ── MCP Server ───────────────────────────────────────
-server = Server(SERVER_NAME)
+server = MCPServer(name=SERVER_NAME, version=SERVER_VERSION)
 client = FreeCADClient()
 
 
-def _tool(name, description, properties, required=None):
-    """Helper to build an MCP Tool definition (SDK 2.0)."""
-    schema = {"type": "object", "properties": properties}
-    if required:
-        schema["required"] = required
-    return types.Tool(name=name, description=description, input_schema=schema)
+def _forward(tool: str, args: dict, timeout: float = 60.0) -> str:
+    """Forward a tool call to FreeCAD and return JSON result."""
+    if tool == "ping":
+        timeout = 5.0
+    elif tool == "run_python":
+        timeout = 120.0
 
+    response = client.send_command(tool, args, timeout=timeout)
 
-# ── Tool Definitions ─────────────────────────────────
-def get_all_tools():
-    """Return the full list of MCP tools."""
-    return [
-        # ── Connection ──
-        _tool(
-            "freecad_ping",
-            "Check if the FreeCAD bridge is running and responsive.",
-            {},
-        ),
-        _tool(
-            "freecad_get_status",
-            "Get FreeCAD addon status (running, connections, last command).",
-            {},
-        ),
-
-        # ── Document ──
-        _tool(
-            "freecad_get_document_info",
-            "Get info about the active FreeCAD document (name, objects, labels).",
-            {},
-        ),
-        _tool(
-            "freecad_new_document",
-            "Create a new FreeCAD document.",
-            {"name": {"type": "string", "description": "Document name", "default": "Document"}},
-        ),
-        _tool(
-            "freecad_save_document",
-            "Save the active FreeCAD document.",
-            {"path": {"type": "string", "description": "File path to save to (optional, uses current path if omitted)"}},
-        ),
-        _tool(
-            "freecad_open_document",
-            "Open an existing FreeCAD document (.FCStd).",
-            {"path": {"type": "string", "description": "Path to the .FCStd file"}},
-            required=["path"],
-        ),
-        _tool(
-            "freecad_list_objects",
-            "List all objects in the active document with their types and bounding boxes.",
-            {},
-        ),
-        _tool(
-            "freecad_get_object_info",
-            "Get detailed info about a specific object (bbox, volume, faces, edges).",
-            {"name": {"type": "string", "description": "Object name"}},
-            required=["name"],
-        ),
-        _tool(
-            "freecad_delete_object",
-            "Delete an object from the document.",
-            {"name": {"type": "string", "description": "Object name to delete"}},
-            required=["name"],
-        ),
-        _tool(
-            "freecad_undo",
-            "Undo the last operation.",
-            {},
-        ),
-        _tool(
-            "freecad_redo",
-            "Redo the last undone operation.",
-            {},
-        ),
-
-        # ── Part Primitives ──
-        _tool(
-            "freecad_create_box",
-            "Create a box (cuboid) in the active document.",
-            {
-                "length": {"type": "number", "description": "Length in X (mm)", "default": 10},
-                "width": {"type": "number", "description": "Width in Y (mm)", "default": 10},
-                "height": {"type": "number", "description": "Height in Z (mm)", "default": 10},
-                "x": {"type": "number", "description": "X position", "default": 0},
-                "y": {"type": "number", "description": "Y position", "default": 0},
-                "z": {"type": "number", "description": "Z position", "default": 0},
-                "name": {"type": "string", "description": "Object name (optional)"},
-            },
-        ),
-        _tool(
-            "freecad_create_cylinder",
-            "Create a cylinder in the active document.",
-            {
-                "radius": {"type": "number", "description": "Radius in mm", "default": 5},
-                "height": {"type": "number", "description": "Height in mm", "default": 10},
-                "x": {"type": "number", "description": "X position", "default": 0},
-                "y": {"type": "number", "description": "Y position", "default": 0},
-                "z": {"type": "number", "description": "Z position", "default": 0},
-                "name": {"type": "string", "description": "Object name (optional)"},
-            },
-        ),
-        _tool(
-            "freecad_create_sphere",
-            "Create a sphere in the active document.",
-            {
-                "radius": {"type": "number", "description": "Radius in mm", "default": 5},
-                "x": {"type": "number", "description": "X position", "default": 0},
-                "y": {"type": "number", "description": "Y position", "default": 0},
-                "z": {"type": "number", "description": "Z position", "default": 0},
-                "name": {"type": "string", "description": "Object name (optional)"},
-            },
-        ),
-        _tool(
-            "freecad_create_cone",
-            "Create a cone in the active document.",
-            {
-                "radius1": {"type": "number", "description": "Bottom radius in mm", "default": 5},
-                "radius2": {"type": "number", "description": "Top radius in mm (0 for point)", "default": 0},
-                "height": {"type": "number", "description": "Height in mm", "default": 10},
-                "x": {"type": "number", "description": "X position", "default": 0},
-                "y": {"type": "number", "description": "Y position", "default": 0},
-                "z": {"type": "number", "description": "Z position", "default": 0},
-                "name": {"type": "string", "description": "Object name (optional)"},
-            },
-        ),
-        _tool(
-            "freecad_create_torus",
-            "Create a torus (donut) in the active document.",
-            {
-                "radius1": {"type": "number", "description": "Major radius (center to tube center) in mm", "default": 10},
-                "radius2": {"type": "number", "description": "Minor radius (tube thickness) in mm", "default": 3},
-                "x": {"type": "number", "description": "X position", "default": 0},
-                "y": {"type": "number", "description": "Y position", "default": 0},
-                "z": {"type": "number", "description": "Z position", "default": 0},
-                "name": {"type": "string", "description": "Object name (optional)"},
-            },
-        ),
-
-        # ── Boolean Operations ──
-        _tool(
-            "freecad_fuse_objects",
-            "Fuse (union) two or more objects together into one solid.",
-            {
-                "objects": {"type": "array", "items": {"type": "string"}, "description": "List of object names to fuse"},
-                "name": {"type": "string", "description": "Name for the result (optional)"},
-            },
-            required=["objects"],
-        ),
-        _tool(
-            "freecad_cut_objects",
-            "Cut (subtract) tool objects from a base object.",
-            {
-                "base": {"type": "string", "description": "Base object name"},
-                "tools": {"type": "array", "items": {"type": "string"}, "description": "Objects to subtract"},
-                "name": {"type": "string", "description": "Name for the result (optional)"},
-            },
-            required=["base", "tools"],
-        ),
-        _tool(
-            "freecad_common_objects",
-            "Find the common (intersection) volume of two or more objects.",
-            {
-                "objects": {"type": "array", "items": {"type": "string"}, "description": "List of object names"},
-                "name": {"type": "string", "description": "Name for the result (optional)"},
-            },
-            required=["objects"],
-        ),
-
-        # ── Transformations ──
-        _tool(
-            "freecad_move_object",
-            "Move (translate) an object.",
-            {
-                "object_name": {"type": "string", "description": "Object to move"},
-                "x": {"type": "number", "description": "X displacement in mm", "default": 0},
-                "y": {"type": "number", "description": "Y displacement in mm", "default": 0},
-                "z": {"type": "number", "description": "Z displacement in mm", "default": 0},
-            },
-            required=["object_name"],
-        ),
-        _tool(
-            "freecad_rotate_object",
-            "Rotate an object around an axis.",
-            {
-                "object_name": {"type": "string", "description": "Object to rotate"},
-                "axis": {"type": "string", "enum": ["x", "y", "z"], "description": "Rotation axis", "default": "z"},
-                "angle": {"type": "number", "description": "Angle in degrees", "default": 90},
-                "center": {"type": "array", "items": {"type": "number"}, "description": "Rotation center [x,y,z] (default: origin)"},
-            },
-            required=["object_name"],
-        ),
-        _tool(
-            "freecad_scale_object",
-            "Scale an object by a factor.",
-            {
-                "object_name": {"type": "string", "description": "Object to scale"},
-                "factor": {"type": "number", "description": "Scale factor (1.0 = no change)", "default": 1.0},
-                "center": {"type": "array", "items": {"type": "number"}, "description": "Scale center [x,y,z] (default: origin)"},
-            },
-            required=["object_name"],
-        ),
-        _tool(
-            "freecad_mirror_object",
-            "Create a mirror copy of an object across a plane.",
-            {
-                "object_name": {"type": "string", "description": "Object to mirror"},
-                "plane": {"type": "string", "enum": ["XY", "XZ", "YZ"], "description": "Mirror plane", "default": "YZ"},
-                "name": {"type": "string", "description": "Name for the mirror copy (optional)"},
-            },
-            required=["object_name"],
-        ),
-        _tool(
-            "freecad_copy_object",
-            "Create a copy of an object, optionally offset.",
-            {
-                "object_name": {"type": "string", "description": "Object to copy"},
-                "name": {"type": "string", "description": "Name for the copy (optional)"},
-                "x": {"type": "number", "description": "X offset", "default": 0},
-                "y": {"type": "number", "description": "Y offset", "default": 0},
-                "z": {"type": "number", "description": "Z offset", "default": 0},
-            },
-            required=["object_name"],
-        ),
-
-        # ── Dress-up ──
-        _tool(
-            "freecad_fillet_object",
-            "Apply a fillet to edges of an object. If no edges specified, fillets all edges.",
-            {
-                "object_name": {"type": "string", "description": "Object to fillet"},
-                "radius": {"type": "number", "description": "Fillet radius in mm", "default": 1.0},
-                "edges": {"type": "array", "items": {"type": "integer"}, "description": "Edge indices to fillet (optional, all if omitted)"},
-                "name": {"type": "string", "description": "Name for the result (optional)"},
-            },
-            required=["object_name"],
-        ),
-        _tool(
-            "freecad_chamfer_object",
-            "Apply a chamfer to edges of an object. If no edges specified, chamfers all edges.",
-            {
-                "object_name": {"type": "string", "description": "Object to chamfer"},
-                "distance": {"type": "number", "description": "Chamfer distance in mm", "default": 1.0},
-                "edges": {"type": "array", "items": {"type": "integer"}, "description": "Edge indices to chamfer (optional, all if omitted)"},
-                "name": {"type": "string", "description": "Name for the result (optional)"},
-            },
-            required=["object_name"],
-        ),
-
-        # ── Sketching ──
-        _tool(
-            "freecad_create_sketch",
-            "Create a new sketch object.",
-            {
-                "name": {"type": "string", "description": "Sketch name (optional)"},
-                "plane": {"type": "string", "enum": ["XY", "XZ", "YZ"], "description": "Sketch plane", "default": "XY"},
-            },
-        ),
-        _tool(
-            "freecad_add_sketch_line",
-            "Add a line to a sketch.",
-            {
-                "sketch_name": {"type": "string", "description": "Sketch object name"},
-                "x1": {"type": "number", "description": "Start X", "default": 0},
-                "y1": {"type": "number", "description": "Start Y", "default": 0},
-                "x2": {"type": "number", "description": "End X", "default": 10},
-                "y2": {"type": "number", "description": "End Y", "default": 0},
-            },
-            required=["sketch_name"],
-        ),
-        _tool(
-            "freecad_add_sketch_circle",
-            "Add a circle to a sketch.",
-            {
-                "sketch_name": {"type": "string", "description": "Sketch object name"},
-                "cx": {"type": "number", "description": "Center X", "default": 0},
-                "cy": {"type": "number", "description": "Center Y", "default": 0},
-                "radius": {"type": "number", "description": "Radius in mm", "default": 5},
-            },
-            required=["sketch_name"],
-        ),
-        _tool(
-            "freecad_pad_sketch",
-            "Pad (extrude) a sketch into a 3D solid.",
-            {
-                "sketch_name": {"type": "string", "description": "Sketch object name"},
-                "length": {"type": "number", "description": "Extrusion length in mm", "default": 10},
-                "name": {"type": "string", "description": "Name for the result (optional)"},
-            },
-            required=["sketch_name"],
-        ),
-
-        # ── Export ──
-        _tool(
-            "freecad_export_stl",
-            "Export objects to an STL file (for 3D printing).",
-            {
-                "path": {"type": "string", "description": "Output file path"},
-                "objects": {"type": "array", "items": {"type": "string"}, "description": "Object names (optional, all if omitted)"},
-                "tolerance": {"type": "number", "description": "Mesh linear deflection in mm", "default": 0.1},
-            },
-            required=["path"],
-        ),
-        _tool(
-            "freecad_export_step",
-            "Export objects to a STEP file (for CAD exchange).",
-            {
-                "path": {"type": "string", "description": "Output file path"},
-                "objects": {"type": "array", "items": {"type": "string"}, "description": "Object names (optional, all if omitted)"},
-            },
-            required=["path"],
-        ),
-        _tool(
-            "freecad_export_3mf",
-            "Export objects to a 3MF file (for 3D printing).",
-            {
-                "path": {"type": "string", "description": "Output file path"},
-                "objects": {"type": "array", "items": {"type": "string"}, "description": "Object names (optional, all if omitted)"},
-            },
-            required=["path"],
-        ),
-
-        # ── View ──
-        _tool(
-            "freecad_fit_all",
-            "Fit all objects in the FreeCAD viewport.",
-            {},
-        ),
-        _tool(
-            "freecad_set_view",
-            "Set the viewport to a standard view direction.",
-            {
-                "view": {
-                    "type": "string",
-                    "enum": ["isometric", "front", "top", "right", "rear", "bottom", "left", "axono"],
-                    "description": "View direction",
-                    "default": "isometric",
-                },
-            },
-        ),
-        _tool(
-            "freecad_screenshot",
-            "Capture a screenshot of the FreeCAD viewport and save to a PNG file.",
-            {
-                "path": {"type": "string", "description": "Output PNG path (optional, uses temp dir if omitted)"},
-                "width": {"type": "integer", "description": "Image width in pixels", "default": 1920},
-                "height": {"type": "integer", "description": "Image height in pixels", "default": 1080},
-            },
-        ),
-
-        # ── Advanced ──
-        _tool(
-            "freecad_run_python",
-            "Execute arbitrary Python code in the FreeCAD context. This is the most powerful tool — "
-            "use it for complex geometry, parametric models, or anything the specific tools don't cover. "
-            "The code has access to FreeCAD, Part, Sketcher, Mesh, MeshPart, os, json, math. "
-            "Set a variable named 'result' to return a value.",
-            {
-                "code": {"type": "string", "description": "Python code to execute in FreeCAD context"},
-            },
-            required=["code"],
-        ),
-        _tool(
-            "freecad_get_selection",
-            "Get the current selection in the FreeCAD GUI (objects the user has selected).",
-            {},
-        ),
-    ]
-
-
-# ── MCP Handlers (SDK 2.0) ───────────────────────────
-
-async def handle_list_tools(context, params):
-    """Handle tools/list — return all available tools."""
-    return types.ListToolsResult(tools=get_all_tools())
-
-
-async def handle_call_tool(context, params):
-    """Handle tools/call — forward to FreeCAD via TCP."""
-    name = params.name
-    arguments = params.arguments or {}
-
-    # Strip the 'freecad_' prefix to get the FreeCAD tool name
-    fc_tool = name
-    if fc_tool.startswith("freecad_"):
-        fc_tool = fc_tool[len("freecad_"):]
-
-    # Special case: ping doesn't need FreeCAD
-    if fc_tool == "ping":
-        response = client.send_command("ping", {}, timeout=5.0)
-        if "error" in response:
-            return types.CallToolResult(
-                content=[types.TextContent(type="text", text=json.dumps(response))],
-                is_error=True,
-            )
-        return types.CallToolResult(
-            content=[types.TextContent(type="text", text=json.dumps(response.get("result", response)))]
-        )
-
-    # Special case: get_status
-    if fc_tool == "get_status":
-        response = client.send_command("ping", {}, timeout=5.0)
-        if "error" in response:
-            return types.CallToolResult(
-                content=[types.TextContent(type="text", text=json.dumps({
-                    "status": "OFFLINE",
-                    "detail": response["error"],
-                }))],
-                is_error=True,
-            )
-        return types.CallToolResult(
-            content=[types.TextContent(type="text", text=json.dumps({
-                "status": "ONLINE",
-                "host": FREECAD_HOST,
-                "port": FREECAD_PORT,
-            }))]
-        )
-
-    # Forward to FreeCAD
-    timeout = 60.0
-    if fc_tool in ("run_python",):
-        timeout = 120.0  # Long-running scripts
-
-    response = client.send_command(fc_tool, arguments, timeout=timeout)
-
-    # Format the response
     if "error" in response:
         text = json.dumps({"error": response["error"]})
         if "traceback" in response:
             text += "\n\nTraceback:\n" + response["traceback"]
-        return types.CallToolResult(
-            content=[types.TextContent(type="text", text=text)],
-            is_error=True,
-        )
+        return text
 
     result = response.get("result", response)
-    text = json.dumps(result, indent=2)
-    return types.CallToolResult(
-        content=[types.TextContent(type="text", text=text)]
-    )
+    return json.dumps(result, indent=2)
 
 
-# ── Register handlers ────────────────────────────────
-server.add_request_handler("tools/list", types.PaginatedRequestParams, handle_list_tools)
-server.add_request_handler("tools/call", types.CallToolRequestParams, handle_call_tool)
+# ── Tool Definitions ─────────────────────────────────
+# Each @server.tool() registers a tool with MCPServer.
+# The function name becomes the tool name (prefixed with freecad_ below).
+
+
+# ── Connection ──
+
+@server.tool()
+def freecad_ping() -> str:
+    """Check if the FreeCAD bridge is running and responsive."""
+    return _forward("ping", {})
+
+
+@server.tool()
+def freecad_get_status() -> str:
+    """Get FreeCAD addon status (running, connections, last command)."""
+    response = client.send_command("ping", {}, timeout=5.0)
+    if "error" in response:
+        return json.dumps({"status": "OFFLINE", "detail": response["error"]})
+    return json.dumps({"status": "ONLINE", "host": FREECAD_HOST, "port": FREECAD_PORT})
+
+
+# ── Document ──
+
+@server.tool()
+def freecad_get_document_info() -> str:
+    """Get info about the active FreeCAD document (name, objects, labels)."""
+    return _forward("get_document_info", {})
+
+
+@server.tool()
+def freecad_new_document(name: str = "Document") -> str:
+    """Create a new FreeCAD document."""
+    return _forward("new_document", {"name": name})
+
+
+@server.tool()
+def freecad_save_document(path: str = "") -> str:
+    """Save the active FreeCAD document."""
+    args = {}
+    if path:
+        args["path"] = path
+    return _forward("save_document", args)
+
+
+@server.tool()
+def freecad_open_document(path: str) -> str:
+    """Open an existing FreeCAD document (.FCStd)."""
+    return _forward("open_document", {"path": path})
+
+
+@server.tool()
+def freecad_list_objects() -> str:
+    """List all objects in the active document with their types and bounding boxes."""
+    return _forward("list_objects", {})
+
+
+@server.tool()
+def freecad_get_object_info(name: str) -> str:
+    """Get detailed info about a specific object (bbox, volume, faces, edges)."""
+    return _forward("get_object_info", {"name": name})
+
+
+@server.tool()
+def freecad_delete_object(name: str) -> str:
+    """Delete an object from the document."""
+    return _forward("delete_object", {"name": name})
+
+
+@server.tool()
+def freecad_undo() -> str:
+    """Undo the last operation."""
+    return _forward("undo", {})
+
+
+@server.tool()
+def freecad_redo() -> str:
+    """Redo the last undone operation."""
+    return _forward("redo", {})
+
+
+# ── Part Primitives ──
+
+@server.tool()
+def freecad_create_box(
+    length: float = 10, width: float = 10, height: float = 10,
+    x: float = 0, y: float = 0, z: float = 0, name: str = "",
+) -> str:
+    """Create a box (cuboid) in the active document. All dimensions in mm."""
+    args = {"length": length, "width": width, "height": height, "x": x, "y": y, "z": z}
+    if name:
+        args["name"] = name
+    return _forward("create_box", args)
+
+
+@server.tool()
+def freecad_create_cylinder(
+    radius: float = 5, height: float = 10,
+    x: float = 0, y: float = 0, z: float = 0, name: str = "",
+) -> str:
+    """Create a cylinder in the active document. Dimensions in mm."""
+    args = {"radius": radius, "height": height, "x": x, "y": y, "z": z}
+    if name:
+        args["name"] = name
+    return _forward("create_cylinder", args)
+
+
+@server.tool()
+def freecad_create_sphere(
+    radius: float = 5,
+    x: float = 0, y: float = 0, z: float = 0, name: str = "",
+) -> str:
+    """Create a sphere in the active document. Dimensions in mm."""
+    args = {"radius": radius, "x": x, "y": y, "z": z}
+    if name:
+        args["name"] = name
+    return _forward("create_sphere", args)
+
+
+@server.tool()
+def freecad_create_cone(
+    radius1: float = 5, radius2: float = 0, height: float = 10,
+    x: float = 0, y: float = 0, z: float = 0, name: str = "",
+) -> str:
+    """Create a cone in the active document. radius1=bottom, radius2=top (0 for point). Dimensions in mm."""
+    args = {"radius1": radius1, "radius2": radius2, "height": height, "x": x, "y": y, "z": z}
+    if name:
+        args["name"] = name
+    return _forward("create_cone", args)
+
+
+@server.tool()
+def freecad_create_torus(
+    radius1: float = 10, radius2: float = 3,
+    x: float = 0, y: float = 0, z: float = 0, name: str = "",
+) -> str:
+    """Create a torus (donut) in the active document. radius1=major, radius2=minor. Dimensions in mm."""
+    args = {"radius1": radius1, "radius2": radius2, "x": x, "y": y, "z": z}
+    if name:
+        args["name"] = name
+    return _forward("create_torus", args)
+
+
+# ── Boolean Operations ──
+
+@server.tool()
+def freecad_fuse_objects(objects: list[str], name: str = "") -> str:
+    """Fuse (union) two or more objects together into one solid."""
+    args = {"objects": objects}
+    if name:
+        args["name"] = name
+    return _forward("fuse_objects", args)
+
+
+@server.tool()
+def freecad_cut_objects(base: str, tools: list[str], name: str = "") -> str:
+    """Cut (subtract) tool objects from a base object."""
+    args = {"base": base, "tools": tools}
+    if name:
+        args["name"] = name
+    return _forward("cut_objects", args)
+
+
+@server.tool()
+def freecad_common_objects(objects: list[str], name: str = "") -> str:
+    """Find the common (intersection) volume of two or more objects."""
+    args = {"objects": objects}
+    if name:
+        args["name"] = name
+    return _forward("common_objects", args)
+
+
+# ── Transformations ──
+
+@server.tool()
+def freecad_move_object(
+    object_name: str,
+    x: float = 0, y: float = 0, z: float = 0,
+) -> str:
+    """Move (translate) an object. Displacements in mm."""
+    return _forward("move_object", {"object_name": object_name, "x": x, "y": y, "z": z})
+
+
+@server.tool()
+def freecad_rotate_object(
+    object_name: str,
+    axis: str = "z",
+    angle: float = 90,
+    center: list[float] = None,
+) -> str:
+    """Rotate an object around an axis. axis: x|y|z, angle in degrees."""
+    args = {"object_name": object_name, "axis": axis, "angle": angle}
+    if center:
+        args["center"] = center
+    return _forward("rotate_object", args)
+
+
+@server.tool()
+def freecad_scale_object(
+    object_name: str,
+    factor: float = 1.0,
+    center: list[float] = None,
+) -> str:
+    """Scale an object by a factor (1.0 = no change)."""
+    args = {"object_name": object_name, "factor": factor}
+    if center:
+        args["center"] = center
+    return _forward("scale_object", args)
+
+
+@server.tool()
+def freecad_mirror_object(
+    object_name: str,
+    plane: str = "YZ",
+    name: str = "",
+) -> str:
+    """Create a mirror copy of an object across a plane. plane: XY|XZ|YZ."""
+    args = {"object_name": object_name, "plane": plane}
+    if name:
+        args["name"] = name
+    return _forward("mirror_object", args)
+
+
+@server.tool()
+def freecad_copy_object(
+    object_name: str,
+    name: str = "",
+    x: float = 0, y: float = 0, z: float = 0,
+) -> str:
+    """Create a copy of an object, optionally offset."""
+    args = {"object_name": object_name, "x": x, "y": y, "z": z}
+    if name:
+        args["name"] = name
+    return _forward("copy_object", args)
+
+
+# ── Dress-up ──
+
+@server.tool()
+def freecad_fillet_object(
+    object_name: str,
+    radius: float = 1.0,
+    edges: list[int] = None,
+    name: str = "",
+) -> str:
+    """Apply a fillet to edges of an object. If no edges specified, fillets all edges."""
+    args = {"object_name": object_name, "radius": radius}
+    if edges:
+        args["edges"] = edges
+    if name:
+        args["name"] = name
+    return _forward("fillet_object", args)
+
+
+@server.tool()
+def freecad_chamfer_object(
+    object_name: str,
+    distance: float = 1.0,
+    edges: list[int] = None,
+    name: str = "",
+) -> str:
+    """Apply a chamfer to edges of an object. If no edges specified, chamfers all edges."""
+    args = {"object_name": object_name, "distance": distance}
+    if edges:
+        args["edges"] = edges
+    if name:
+        args["name"] = name
+    return _forward("chamfer_object", args)
+
+
+# ── Sketching ──
+
+@server.tool()
+def freecad_create_sketch(name: str = "", plane: str = "XY") -> str:
+    """Create a new sketch object on a plane. plane: XY|XZ|YZ."""
+    args = {"plane": plane}
+    if name:
+        args["name"] = name
+    return _forward("create_sketch", args)
+
+
+@server.tool()
+def freecad_add_sketch_line(
+    sketch_name: str,
+    x1: float = 0, y1: float = 0,
+    x2: float = 10, y2: float = 0,
+) -> str:
+    """Add a line to a sketch. Coordinates in mm."""
+    return _forward("add_sketch_line", {
+        "sketch_name": sketch_name,
+        "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+    })
+
+
+@server.tool()
+def freecad_add_sketch_circle(
+    sketch_name: str,
+    cx: float = 0, cy: float = 0,
+    radius: float = 5,
+) -> str:
+    """Add a circle to a sketch. Coordinates and radius in mm."""
+    return _forward("add_sketch_circle", {
+        "sketch_name": sketch_name,
+        "cx": cx, "cy": cy, "radius": radius,
+    })
+
+
+@server.tool()
+def freecad_add_sketch_arc(
+    sketch_name: str,
+    x1: float, y1: float,
+    x2: float, y2: float,
+    xm: float, ym: float,
+) -> str:
+    """Add an arc to a sketch. (x1,y1)=start, (x2,y2)=end, (xm,ym)=midpoint."""
+    return _forward("add_sketch_arc", {
+        "sketch_name": sketch_name,
+        "x1": x1, "y1": y1, "x2": x2, "y2": y2, "xm": xm, "ym": ym,
+    })
+
+
+@server.tool()
+def freecad_add_constraint(
+    sketch_name: str,
+    ctype: str,
+    p1: list[int] = None,
+    p2: list[int] = None,
+    value: float = None,
+    geo1: int = None,
+    geo2: int = None,
+) -> str:
+    """Add a constraint to a sketch.
+
+    ctype: coincident, point_on_line, distance, distance_x, distance_y,
+           horizontal, vertical, parallel, perpendicular, tangent, equal,
+           symmetric, angle, radius, diameter, fixed, block
+
+    Point-based (coincident, point_on_line, distance): p1=[geoId,posId], p2=[geoId,posId]
+    Line-based (horizontal, vertical, fixed, block): geo1
+    Two-line (parallel, perpendicular, tangent, equal, angle): geo1, geo2
+    Radius/Diameter: geo1 + value
+    Symmetric: p1, p2 + geo1 (axis)
+
+    posId: 1=start point, 2=end point, 3=center (for circles/arcs)
+    Returns constraint count and DoF (0 = fully constrained / green).
+    """
+    args = {"sketch_name": sketch_name, "ctype": ctype}
+    if p1 is not None:
+        args["p1"] = p1
+    if p2 is not None:
+        args["p2"] = p2
+    if value is not None:
+        args["value"] = value
+    if geo1 is not None:
+        args["geo1"] = geo1
+    if geo2 is not None:
+        args["geo2"] = geo2
+    return _forward("add_constraint", args)
+
+
+@server.tool()
+def freecad_get_sketch_info(sketch_name: str) -> str:
+    """Get detailed info about a sketch: geometry types, constraints, DoF, fully-constrained status."""
+    return _forward("get_sketch_info", {"sketch_name": sketch_name})
+
+
+@server.tool()
+def freecad_solve_sketch(sketch_name: str) -> str:
+    """Force the solver to run on a sketch and report the result (DoF, constraint status)."""
+    return _forward("solve_sketch", {"sketch_name": sketch_name})
+
+
+@server.tool()
+def freecad_pad_sketch(
+    sketch_name: str,
+    length: float = 10,
+    name: str = "",
+) -> str:
+    """Pad (extrude) a sketch into a 3D solid. Length in mm."""
+    args = {"sketch_name": sketch_name, "length": length}
+    if name:
+        args["name"] = name
+    return _forward("pad_sketch", args)
+
+
+# ── Export ──
+
+@server.tool()
+def freecad_export_stl(
+    path: str,
+    objects: list[str] = None,
+    tolerance: float = 0.1,
+) -> str:
+    """Export objects to an STL file (for 3D printing)."""
+    args = {"path": path, "tolerance": tolerance}
+    if objects:
+        args["objects"] = objects
+    return _forward("export_stl", args)
+
+
+@server.tool()
+def freecad_export_step(
+    path: str,
+    objects: list[str] = None,
+) -> str:
+    """Export objects to a STEP file (for CAD exchange)."""
+    args = {"path": path}
+    if objects:
+        args["objects"] = objects
+    return _forward("export_step", args)
+
+
+@server.tool()
+def freecad_export_3mf(
+    path: str,
+    objects: list[str] = None,
+) -> str:
+    """Export objects to a 3MF file (for 3D printing)."""
+    args = {"path": path}
+    if objects:
+        args["objects"] = objects
+    return _forward("export_3mf", args)
+
+
+# ── View ──
+
+@server.tool()
+def freecad_fit_all() -> str:
+    """Fit all objects in the FreeCAD viewport."""
+    return _forward("fit_all", {})
+
+
+@server.tool()
+def freecad_set_view(view: str = "isometric") -> str:
+    """Set the viewport to a standard view direction.
+    view: isometric|front|top|right|rear|bottom|left|axono"""
+    return _forward("set_view", {"view": view})
+
+
+@server.tool()
+def freecad_screenshot(
+    path: str = "",
+    width: int = 1920,
+    height: int = 1080,
+) -> str:
+    """Capture a screenshot of the FreeCAD viewport and save to a PNG file."""
+    args = {"width": width, "height": height}
+    if path:
+        args["path"] = path
+    return _forward("screenshot", args)
+
+
+# ── Advanced ──
+
+@server.tool()
+def freecad_run_python(code: str) -> str:
+    """Execute arbitrary Python code in the FreeCAD context. This is the most powerful tool —
+    use it for complex geometry, parametric models, or anything the specific tools don't cover.
+    The code has access to FreeCAD, Part, Sketcher, Mesh, MeshPart, os, json, math.
+    Set a variable named 'result' to return a value."""
+    return _forward("run_python", {"code": code}, timeout=120.0)
+
+
+@server.tool()
+def freecad_get_selection() -> str:
+    """Get the current selection in the FreeCAD GUI (objects the user has selected)."""
+    return _forward("get_selection", {})
 
 
 # ── Main ─────────────────────────────────────────────
 
-async def main():
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream,
-            write_stream,
-            server.create_initialization_options(),
+def main():
+    parser = argparse.ArgumentParser(description="FreeCAD MCP Server")
+    parser.add_argument("--http", action="store_true", help="Run in HTTP (streamable) mode")
+    parser.add_argument("--host", default="0.0.0.0", help="HTTP bind host (default: 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=8000, help="HTTP port (default: 8000)")
+    args = parser.parse_args()
+
+    if args.http:
+        print(f"FreeCAD MCP Server — HTTP mode on {args.host}:{args.port}/mcp", file=sys.stderr)
+        print(f"  FreeCAD bridge: {FREECAD_HOST}:{FREECAD_PORT}", file=sys.stderr)
+        server.run(
+            transport="streamable-http",
+            host=args.host,
+            port=args.port,
+            streamable_http_path="/mcp",
+            stateless_http=True,  # No session state — safe for multi-client
         )
+    else:
+        print(f"FreeCAD MCP Server — stdio mode", file=sys.stderr)
+        print(f"  FreeCAD bridge: {FREECAD_HOST}:{FREECAD_PORT}", file=sys.stderr)
+        server.run(transport="stdio")
 
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    main()

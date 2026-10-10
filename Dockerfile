@@ -23,5 +23,7 @@ USER mcp
 ENV FREECAD_HOST=host.docker.internal
 ENV FREECAD_PORT=9876
 
-# MCP stdio transport
-ENTRYPOINT ["python3", "mcp_server.py"]
+# HTTP (streamable) mode — persistent server for multi-agent access
+# Portainer stack maps host port -> 8000
+EXPOSE 8000
+ENTRYPOINT ["python3", "mcp_server.py", "--http", "--host", "0.0.0.0", "--port", "8000"]

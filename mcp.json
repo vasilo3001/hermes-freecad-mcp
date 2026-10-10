@@ -1,8 +1,7 @@
 {
   "servers": {
     "freecad": {
-      "command": "python3",
-      "args": ["${PLUGIN_ROOT}/mcp_server.py"],
+      "url": "http://192.168.1.184:3111/mcp",
       "timeout": 120
     }
   }

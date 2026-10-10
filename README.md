@@ -3,39 +3,49 @@
 Control FreeCAD from **Hermes Agent** via the Model Context Protocol (MCP).
 
 The Hermes Agent drives your FreeCAD GUI in real time — it creates geometry,
-runs booleans, sketches, exports STL/STEP/3MF, and you watch everything happen
-live in the FreeCAD 3D viewport.
+runs booleans, sketches with constraints, exports STL/STEP/3MF, and you watch
+everything happen live in the FreeCAD 3D viewport.
+
+## Architecture
+
+Two deployment modes:
+
+### Mode 1: Local (stdio)
+
+Hermes spawns `mcp_server.py` per-session via stdio:
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  Hermes Agent (desktop app / CLI)                            │
-│  ┌────────────────────────────────────────────────────────┐  │
-│  │  Built-in MCP Client (reads ~/.hermes/config.yaml)     │  │
-│  └───────────────────┬────────────────────────────────────┘  │
-│                      │ stdio (JSON-RPC 2.0)                  │
-│  ┌───────────────────▼────────────────────────────────────┐  │
-│  │  mcp_server.py  (MCP Server — Python)                  │  │
-│  │  • Registers 38 tools for Hermes                       │  │
-│  │  • Forwards commands to FreeCAD addon                  │  │
-│  └───────────────────┬────────────────────────────────────┘  │
-│                      │ TCP localhost:9876 (newline JSON)     │
-│  ┌───────────────────▼────────────────────────────────────┐  │
-│  │  FreeCAD Addon  (runs inside FreeCAD GUI)              │  │
-│  │  • TCP server on 127.0.0.1:9876                        │  │
-│  │  • Executes Python in FreeCAD's own interpreter        │  │
-│  │  • Part, PartDesign, Sketcher, Mesh, TechDraw          │  │
-│  │  • User sees everything live in the 3D viewport        │  │
-│  └────────────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────────┘
+Hermes Agent
+  │ stdio (JSON-RPC 2.0)
+  ▼
+mcp_server.py  (MCP Server — Python)
+  │ TCP 127.0.0.1:9876 (newline JSON)
+  ▼
+FreeCAD Addon  (runs inside FreeCAD GUI)
+```
+
+### Mode 2: Homeserver (HTTP) — recommended for multi-agent
+
+Persistent MCP server in Docker on your homeserver, reachable by multiple
+Hermes agents over LAN or Tailscale:
+
+```
+Hermes Agent (any machine on network)
+  │ HTTP (streamable, JSON-RPC 2.0)
+  ▼
+mcp_server.py --http  (Docker container on homeserver)
+  │ TCP host.docker.internal:9876
+  ▼
+FreeCAD Addon  (runs inside FreeCAD GUI on homeserver)
 ```
 
 ## Requirements
 
 | Component | Version | Notes |
 |-----------|---------|-------|
-| **FreeCAD** | 1.0+ | `apt install freecad` (Ubuntu/Debian) or download from [freecad.org](https://www.freecad.org/downloads.html) |
-| **Python** | 3.10+ | FreeCAD bundles its own Python; the MCP server uses your system Python |
-| **mcp** | 1.0+ | `pip install mcp` — MCP Python SDK |
+| **FreeCAD** | 1.0+ | `apt install freecad` or [freecad.org](https://www.freecad.org/downloads.html) |
+| **Python** | 3.10+ | MCP server uses system Python; FreeCAD bundles its own |
+| **mcp** | >=2.0.0 | `pip install 'mcp>=2.0.0'` — MCP Python SDK v2 |
 | **Hermes Agent** | latest | With native MCP client support |
 
 ## Installation
@@ -58,6 +68,10 @@ Copy the addon folder into your FreeCAD Mod directory:
 mkdir -p ~/.local/share/FreeCAD/Mod/
 cp -r freecad_addon/hermes_freecad_mcp ~/.local/share/FreeCAD/Mod/
 
+# Flatpak (e.g. Ubuntu with Flatpak FreeCAD)
+mkdir -p ~/.var/app/org.freecad.FreeCAD/data/FreeCAD/v1-1/Mod/
+cp -r freecad_addon/hermes_freecad_mcp ~/.var/app/org.freecad.FreeCAD/data/FreeCAD/v1-1/Mod/
+
 # macOS
 mkdir -p ~/Library/"Application Support"/FreeCAD/Mod/
 cp -r freecad_addon/hermes_freecad_mcp ~/Library/"Application Support"/FreeCAD/Mod/
@@ -66,12 +80,12 @@ cp -r freecad_addon/hermes_freecad_mcp ~/Library/"Application Support"/FreeCAD/M
 ### 3. Install the MCP Server dependency
 
 ```bash
-pip install mcp
+pip install 'mcp>=2.0.0'
 ```
 
 ### 4. Configure Hermes Agent
 
-**Option A: Native Python** (simplest, same machine as FreeCAD)
+**Option A: Local stdio** (simplest, same machine as FreeCAD)
 
 Add to `~/.hermes/config.yaml`:
 
@@ -83,50 +97,54 @@ mcp_servers:
     timeout: 120
 ```
 
-**Option B: Docker** (isolated container)
+**Option B: Homeserver HTTP** (multi-agent, persistent)
 
-Build the image:
-
-```bash
-docker build -t freecad-mcp .
-```
-
-Add to `~/.hermes/config.yaml`:
+Deploy the Portainer stack (`docker-compose.yml`) on your homeserver, then
+add to `~/.hermes/config.yaml`:
 
 ```yaml
 mcp_servers:
   freecad:
-    command: "docker"
-    args:
-      - "run"
-      - "--rm"
-      - "-i"
-      - "--add-host=host.docker.internal:host-gateway"
-      - "-e"
-      - "FREECAD_HOST=host.docker.internal"
-      - "freecad-mcp"
+    url: "http://192.168.1.184:3111/mcp"
     timeout: 120
 ```
 
-> **Note:** `--add-host=host.docker.internal:host-gateway` is required on
-> Linux so the container can reach FreeCAD on the host. On Docker Desktop
-> (macOS/Windows), `host.docker.internal` works out of the box.
+Or via Tailscale (from other machines on the network):
 
-**How it works (Docker):**
-
-```
-Hermes Agent
-  │ stdio (JSON-RPC)
-  ▼
-docker run --rm -i freecad-mcp
-  │ TCP (host.docker.internal:9876)
-  ▼
-FreeCAD Addon (host)
+```yaml
+mcp_servers:
+  freecad:
+    url: "http://<tailscale-ip>:3111/mcp"
+    timeout: 120
 ```
 
-Hermes spawns the container per-session. The container
-runs `mcp_server.py`, which connects to FreeCAD on the host via
-`host.docker.internal:9876`. When the session ends, `--rm` cleans up.
+**Portainer stack** (`docker-compose.yml`):
+
+```yaml
+services:
+  freecadmcp:
+    image: freecad-mcp:latest
+    container_name: freecadmcp
+    restart: unless-stopped
+    ports:
+      - "3111:8000"
+    environment:
+      - FREECAD_HOST=host.docker.internal
+      - FREECAD_PORT=9876
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - homeserver_homeserver-net
+networks:
+  homeserver_homeserver-net:
+    external: true
+```
+
+Build the image first:
+
+```bash
+docker build -t freecad-mcp .
+```
 
 ### 5. Start FreeCAD and Activate the Bridge
 
@@ -140,8 +158,8 @@ runs `mcp_server.py`, which connects to FreeCAD on the host via
 ### 6. Restart Hermes Agent
 
 Restart Hermes so it picks up the new MCP server. On startup it will:
-- Connect to `mcp_server.py` via stdio
-- Discover all 38 FreeCAD tools
+- Connect to `mcp_server.py` (stdio or HTTP)
+- Discover all 42 FreeCAD tools
 - Register them as `mcp_freecad_*` tools
 
 ## Usage
@@ -150,7 +168,7 @@ Just talk to Hermes naturally:
 
 ```
 You:  Create a box 50mm x 30mm x 5mm at the origin
-Hermes: [calls mcp_freecad_create_box]
+Hermes: [calls freecad_create_box]
         → Box created: 50×30×5mm at (0,0,0)
 
 You:  Add a 4mm hole in the center of the top face
@@ -158,23 +176,41 @@ Hermes: [creates cylinder, cuts from box]
         → Hole drilled at center
 
 You:  Fillet all edges with 1mm radius
-Hermes: [calls mcp_freecad_fillet_object]
+Hermes: [calls freecad_fillet_object]
         → All edges filleted
 
 You:  Export to STL for printing
-Hermes: [calls mcp_freecad_export_stl]
+Hermes: [calls freecad_export_stl]
         → Saved to ~/Documents/bracket.stl (12,450 facets)
+```
+
+### Sketching with Constraints
+
+```
+You:  Create a sketch on the XY plane
+Hermes: [calls freecad_create_sketch]
+
+You:  Add a line from (0,0) to (100,0)
+Hermes: [calls freecad_add_sketch_line]
+
+You:  Constrain it to be horizontal and 100mm long
+Hermes: [calls freecad_add_constraint x2]
+        → Constraint count: 2, DoF: 2 (under-constrained)
+
+You:  Lock the start point to the origin
+Hermes: [calls freecad_add_constraint coincident]
+        → Constraint count: 3, DoF: 0 (FULLY CONSTRAINED — green)
 ```
 
 For complex geometry, Hermes can write and execute arbitrary Python:
 
 ```
 You:  Model a 50mm hex bolt with M6 thread, 20mm long
-Hermes: [writes FreeCAD Python script, calls mcp_freecad_run_python]
+Hermes: [writes FreeCAD Python script, calls freecad_run_python]
         → Hex bolt created with 6mm across-flats, 20mm length
 ```
 
-## Available Tools (38)
+## Available Tools (42)
 
 ### Connection
 | Tool | Description |
@@ -228,9 +264,13 @@ Hermes: [writes FreeCAD Python script, calls mcp_freecad_run_python]
 ### Sketching
 | Tool | Description |
 |------|-------------|
-| `freecad_create_sketch` | New sketch |
+| `freecad_create_sketch` | New sketch on a plane |
 | `freecad_add_sketch_line` | Add line to sketch |
 | `freecad_add_sketch_circle` | Add circle to sketch |
+| `freecad_add_sketch_arc` | Add arc to sketch |
+| `freecad_add_constraint` | Add constraint (coincident, distance, horizontal, etc.) |
+| `freecad_get_sketch_info` | Geometry, constraints, DoF, fully-constrained status |
+| `freecad_solve_sketch` | Force solver run, report DoF |
 | `freecad_pad_sketch` | Extrude sketch to solid |
 
 ### Export
@@ -258,7 +298,7 @@ Hermes: [writes FreeCAD Python script, calls mcp_freecad_run_python]
 ```
 freecadMCP vibecoding/
 ├── README.md                    ← This file
-├── mcp_server.py                ← MCP server (Hermes → FreeCAD bridge)
+├── mcp_server.py                ← MCP server (stdio + HTTP transports)
 ├── freecad_addon/
 │   └── hermes_freecad_mcp/      ← FreeCAD addon (copy to Mod dir)
 │       ├── Init.py              ← Addon entry point
@@ -270,54 +310,37 @@ freecadMCP vibecoding/
 │   └── freecad-modeling/
 │       └── SKILL.md             ← Hermes skill (workflow guide)
 ├── test_bridge.py               ← Direct TCP test (run against live bridge)
-├── install.sh                   ← One-command installer (see below)
-├── Dockerfile                   ← Docker image for MCP server
+├── install.sh                   ← One-command installer
+├── Dockerfile                   ← Docker image (HTTP mode)
+├── docker-compose.yml           ← Portainer stack for homeserver deployment
 ├── .dockerignore
 ├── plugin.json                  ← Hermes Portable Agent Plugin manifest
-├── mcp.json                     ← MCP server config (plugin)
+├── mcp.json                     ← MCP server config (HTTP URL)
 └── requirements.txt             ← Python dependencies
 ```
-
-### What `install.sh` does
-
-```
-1. Detects OS (Linux / macOS)
-2. Finds FreeCAD:
-   • System install (freecad in PATH)
-   • Flatpak (flatpak list | grep freecad)
-   • Data dir (~/.local/share/FreeCAD)
-3. Checks Python 3 + installs 'mcp' pip package if missing
-4. Copies freecad_addon/hermes_freecad_mcp/ → FreeCAD Mod directory:
-   • Linux:   ~/.local/share/FreeCAD/Mod/
-   • macOS:   ~/Library/Application Support/FreeCAD/Mod/
-5. Prints the Hermes config.yaml snippet to add
-```
-
-It does NOT modify `config.yaml` automatically — it prints the snippet
-so you can add it yourself (or paste it). This keeps the installer
-non-destructive.
 
 ## Troubleshooting
 
 | Problem | Solution |
 |---------|----------|
 | "Cannot connect to FreeCAD" | Is FreeCAD running? Is the bridge started? Check FreeCAD console. |
-| "mcp package not installed" | `pip install mcp` |
-| Tools not appearing in Hermes | Restart Hermes after config change. Check `~/.hermes/config.yaml` syntax. |
-| FreeCAD addon not showing | Check `~/.local/share/FreeCAD/Mod/hermes_freecad_mcp/` exists. Restart FreeCAD. |
+| "mcp package not installed" | `pip install 'mcp>=2.0.0'` |
+| Tools not appearing in Hermes | Restart Hermes after config change. Check config syntax. |
+| FreeCAD addon not showing | Check Mod directory exists. Restart FreeCAD. |
 | Port 9876 already in use | Change `MCP_BRIDGE_PORT` in `mcp_bridge.py` and `FREECAD_PORT` env var. |
-| Commands time out | Complex geometry can take time. Increase `timeout` in config.yaml. |
+| Commands time out | Complex geometry can take time. Increase `timeout` in config. |
+| HTTP mode: connection refused | Check Docker container is running: `docker ps`. Check port mapping. |
+| HTTP mode: can't reach FreeCAD | Check `FREECAD_HOST` env var. On Linux, `extra_hosts` must include `host.docker.internal:host-gateway`. |
 
 ## Roadmap
 
-- [x] Docker containerized MCP server (stdio)
+- [x] Docker containerized MCP server (HTTP streamable)
+- [x] Sketcher constraint solving (coincident, distance, horizontal, vertical, etc.)
 - [ ] PartDesign workbench integration (pads, pockets, holes with proper constraints)
-- [ ] Sketcher constraint solving
 - [ ] TechDraw automated drawings
 - [ ] FEM analysis hooks
 - [ ] Multi-document support
 - [ ] Windows support (addon Mod path + install script)
-- [ ] WebSocket transport (for remote FreeCAD over LAN)
 
 ## Credits
 
