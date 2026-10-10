@@ -35,9 +35,3 @@ services:
       # FreeCAD bridge on the desktop
       - FREECAD_HOST=192.168.1.177
       - FREECAD_PORT=9876
-    networks:
-      - homeserver_homeserver-net
-
-networks:
-  homeserver_homeserver-net:
-    external: true
