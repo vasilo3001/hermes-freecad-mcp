@@ -1,7 +1,7 @@
 {
   "servers": {
     "freecad": {
-      "url": "http://192.168.1.184:3111/mcp",
+      "url": "http://<homeserver-ip>:3111/mcp",
       "timeout": 120
     }
   }

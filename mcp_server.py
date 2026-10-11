@@ -13,7 +13,7 @@ HTTP mode (recommended for multi-agent / Tailscale):
   # Hermes config:
   #   mcp_servers:
   #     freecad:
-  #       url: "http://192.168.1.184:3111/mcp"
+  #       url: "http://<homeserver-ip>:3111/mcp"
 
 stdio mode (local, single agent):
   python3 mcp_server.py

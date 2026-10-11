@@ -106,7 +106,7 @@ add to `~/.hermes/config.yaml`:
 ```yaml
 mcp_servers:
   freecad:
-    url: "http://192.168.1.184:3111/mcp"
+    url: "http://<homeserver-ip>:3111/mcp"
     timeout: 120
 ```
 
@@ -131,7 +131,7 @@ services:
       - "3111:8000"
     environment:
       # FreeCAD bridge on the desktop
-      - FREECAD_HOST=192.168.1.177
+      - FREECAD_HOST=<desktop-ip>
       - FREECAD_PORT=9876
 ```
 

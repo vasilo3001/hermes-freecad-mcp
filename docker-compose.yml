@@ -10,14 +10,14 @@
 #   Bump the image tag below and redeploy the stack.
 #
 # Requires:
-#   - FreeCAD running on the desktop (192.168.1.177)
+#   - FreeCAD running on the desktop (<desktop-ip>)
 #     with the Hermes MCP workbench active (bridge on port 9876)
 #   - Port 9876 open on the desktop's firewall
 #
 # Hermes connects via HTTP:
 #   mcp_servers:
 #     freecad:
-#       url: "http://192.168.1.184:3111/mcp"
+#       url: "http://<homeserver-ip>:3111/mcp"
 #
 # Or via Tailscale (from other machines):
 #   mcp_servers:
@@ -33,5 +33,5 @@ services:
       - "3111:8000"
     environment:
       # FreeCAD bridge on the desktop
-      - FREECAD_HOST=192.168.1.177
+      - FREECAD_HOST=<desktop-ip>
       - FREECAD_PORT=9876
