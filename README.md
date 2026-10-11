@@ -210,7 +210,7 @@ Hermes: [writes FreeCAD Python script, calls freecad_run_python]
         → Hex bolt created with 6mm across-flats, 20mm length
 ```
 
-## Available Tools (42)
+## Available Tools (48)
 
 ### Connection
 | Tool | Description |
@@ -272,6 +272,16 @@ Hermes: [writes FreeCAD Python script, calls freecad_run_python]
 | `freecad_get_sketch_info` | Geometry, constraints, DoF, fully-constrained status |
 | `freecad_solve_sketch` | Force solver run, report DoF |
 | `freecad_pad_sketch` | Extrude sketch to solid |
+
+### PartDesign
+| Tool | Description |
+|------|-------------|
+| `freecad_create_body` | Create PartDesign Body |
+| `freecad_pocket_sketch` | Pocket (cut extrusion) |
+| `freecad_revolution_sketch` | Revolution (revolve) |
+| `freecad_groove_sketch` | Groove (subtractive revolution) |
+| `freecad_partdesign_fillet` | PartDesign fillet |
+| `freecad_partdesign_chamfer` | PartDesign chamfer |
 
 ### Export
 | Tool | Description |
@@ -336,7 +346,9 @@ freecadMCP vibecoding/
 
 - [x] Docker containerized MCP server (HTTP streamable)
 - [x] Sketcher constraint solving (coincident, distance, horizontal, vertical, etc.)
-- [ ] PartDesign workbench integration (pads, pockets, holes with proper constraints)
+- [x] PartDesign workbench integration (Body, Pad, Pocket, Revolution, Groove, Fillet, Chamfer)
+- [x] Queue-based thread safety (QTimer polling, no QMetaObject.invokeMethod)
+- [x] Proper DoF calculation via sketch.solve()
 - [ ] TechDraw automated drawings
 - [ ] FEM analysis hooks
 - [ ] Multi-document support
@@ -345,6 +357,7 @@ freecadMCP vibecoding/
 ## Credits
 
 - Architecture inspired by [contextform/freecad-mcp](https://github.com/contextform/freecad-mcp)
+- PartDesign tools and queue-based thread safety pattern borrowed from [spkane/freecad-addon-robust-mcp-server](https://github.com/spkane/freecad-addon-robust-mcp-server)
 - MCP protocol by [Model Context Protocol](https://modelcontextprotocol.io/)
 - FreeCAD by the [FreeCAD community](https://www.freecad.org/)
 

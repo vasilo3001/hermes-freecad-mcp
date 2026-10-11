@@ -513,6 +513,96 @@ def freecad_pad_sketch(
     return _forward("pad_sketch", args)
 
 
+# ── PartDesign ──
+
+@server.tool()
+def freecad_create_body(name: str = "") -> str:
+    """Create a new PartDesign Body (container for feature-based modeling)."""
+    args = {}
+    if name:
+        args["name"] = name
+    return _forward("create_body", args)
+
+
+@server.tool()
+def freecad_pocket_sketch(
+    sketch_name: str,
+    length: float = 10,
+    pocket_type: str = "Length",
+    name: str = "",
+) -> str:
+    """Create a PartDesign Pocket (cut extrusion) from a sketch in a Body.
+    pocket_type: Length|ThroughAll|UpToFace|UpToVertex|TwoLengths"""
+    args = {"sketch_name": sketch_name, "length": length, "pocket_type": pocket_type}
+    if name:
+        args["name"] = name
+    return _forward("pocket_sketch", args)
+
+
+@server.tool()
+def freecad_revolution_sketch(
+    sketch_name: str,
+    angle: float = 360.0,
+    axis: str = "Base_Y",
+    name: str = "",
+) -> str:
+    """Create a PartDesign Revolution (revolve) from a sketch in a Body.
+    axis: Base_X|Base_Y|Base_Z|Sketch_H|Sketch_V"""
+    args = {"sketch_name": sketch_name, "angle": angle, "axis": axis}
+    if name:
+        args["name"] = name
+    return _forward("revolution_sketch", args)
+
+
+@server.tool()
+def freecad_groove_sketch(
+    sketch_name: str,
+    angle: float = 360.0,
+    axis: str = "Base_Y",
+    name: str = "",
+) -> str:
+    """Create a PartDesign Groove (subtractive revolution) from a sketch in a Body.
+    axis: Base_X|Base_Y|Base_Z|Sketch_H|Sketch_V"""
+    args = {"sketch_name": sketch_name, "angle": angle, "axis": axis}
+    if name:
+        args["name"] = name
+    return _forward("groove_sketch", args)
+
+
+@server.tool()
+def freecad_partdesign_fillet(
+    object_name: str,
+    radius: float = 1.0,
+    edges: list[str] = None,
+    name: str = "",
+) -> str:
+    """Add a PartDesign Fillet to an object in a Body.
+    edges: list of edge names (e.g. ["Edge1", "Edge3"]), or None for all edges."""
+    args = {"object_name": object_name, "radius": radius}
+    if edges:
+        args["edges"] = edges
+    if name:
+        args["name"] = name
+    return _forward("partdesign_fillet", args)
+
+
+@server.tool()
+def freecad_partdesign_chamfer(
+    object_name: str,
+    size: float = 1.0,
+    edges: list[str] = None,
+    name: str = "",
+) -> str:
+    """Add a PartDesign Chamfer to an object in a Body.
+    edges: list of edge names (e.g. ["Edge1", "Edge3"]), or None for all edges."""
+    args = {"object_name": object_name, "size": size}
+    if edges:
+        args["edges"] = edges
+    if name:
+        args["name"] = name
+    return _forward("partdesign_chamfer", args)
+
+
 # ── Export ──
 
 @server.tool()

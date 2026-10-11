@@ -8,7 +8,9 @@ executes them in the FreeCAD context. All geometry operations happen
 here, so the user sees everything live in the FreeCAD 3D viewport.
 
 Thread safety: FreeCAD's Python API is NOT thread-safe. All FreeCAD
-calls are marshalled to the main (GUI) thread via Qt's event loop.
+calls are marshalled to the main (GUI) thread via a queue.Queue + QTimer
+polling pattern (inspired by neka-nat/freecad-mcp and
+spkane/freecad-addon-robust-mcp-server).
 
 Protocol: newline-delimited JSON over TCP.
   Request:  {"id": 1, "tool": "create_box", "args": {...}}\n
@@ -17,11 +19,14 @@ Protocol: newline-delimited JSON over TCP.
 
 import json
 import os
+import queue
 import socket
 import threading
 import traceback
 import time
 import itertools
+import atexit
+import contextlib
 
 import FreeCAD
 import Part
@@ -29,65 +34,44 @@ from PySide import QtCore
 
 MCP_BRIDGE_PORT = 9876
 HOST = "0.0.0.0"  # Listen on all interfaces (allows remote MCP server)
+QUEUE_POLL_INTERVAL_MS = 50  # How often the QTimer polls the queue
 _req_counter = itertools.count(1)
 
+# Global registry of active servers for cleanup on Python exit
+_active_servers = []
+_atexit_registered = False
 
-class _MainThreadDispatcher(QtCore.QObject):
-    """QObject that lives on the main thread and executes FreeCAD calls."""
 
-    def __init__(self):
-        super().__init__()
-        self._results = {}
-        self._lock = threading.Lock()
-        self._pending = {}
+def _cleanup_all_servers():
+    """Clean up all active MCP servers before Python exits.
 
-    def execute_on_main(self, func, args, kwargs, req_id):
-        """Schedule func to run on the main thread, store result by req_id."""
-        with self._lock:
-            self._pending[req_id] = (func, args, kwargs)
+    This is registered with atexit to ensure QTimer objects are properly
+    destroyed BEFORE Python's garbage collector runs during Py_FinalizeEx.
+    """
+    for server in list(_active_servers):
+        with contextlib.suppress(Exception):
+            server._cleanup_for_exit()
 
-        # Use QMetaObject to safely invoke on main thread
-        QtCore.QMetaObject.invokeMethod(
-            self,
-            "_execute_pending",
-            QtCore.Qt.QueuedConnection,
-            QtCore.Q_ARG("int", req_id),
-        )
 
-    def _execute_pending(self, req_id):
-        """Slot: execute the pending function on the main thread."""
-        with self._lock:
-            if req_id not in self._pending:
-                return
-            func, args, kwargs = self._pending.pop(req_id)
+class ExecutionRequest:
+    """Represents a code execution request."""
 
-        try:
-            result = func(*args, **kwargs)
-            with self._lock:
-                self._results[req_id] = {"result": result}
-        except Exception as e:
-            with self._lock:
-                self._results[req_id] = {
-                    "error": "%s: %s" % (type(e).__name__, str(e)),
-                    "traceback": traceback.format_exc(),
-                }
-
-    # Qt slot decorator
-    _execute_pending = QtCore.Slot("int")(_execute_pending)
-
-    def get_result(self, req_id, timeout=60.0):
-        """Wait for the result of a scheduled execution."""
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            with self._lock:
-                if req_id in self._results:
-                    return self._results.pop(req_id)
-            time.sleep(0.01)
-        raise TimeoutError("FreeCAD command timed out after %.0fs" % timeout)
+    def __init__(self, func, args, kwargs, req_id, timeout=60.0):
+        self.func = func
+        self.args = args
+        self.kwargs = kwargs
+        self.req_id = req_id
+        self.timeout = timeout
+        self.result = None
+        self.completed = threading.Event()
 
 
 class MCPBridgeServer:
-    """TCP server that accepts commands from the MCP bridge."""
+    """TCP server that accepts commands from the MCP bridge.
+
+    Uses a queue.Queue + QTimer pattern for thread-safe execution of
+    FreeCAD API calls on the main GUI thread.
+    """
 
     def __init__(self, port=MCP_BRIDGE_PORT):
         self.port = port
@@ -98,35 +82,102 @@ class MCPBridgeServer:
         self.connection_count = 0
         self.last_command_time = None
         self.command_log = []
-        self._dispatcher = _MainThreadDispatcher()
+
+        # Queue-based execution for thread safety
+        self._request_queue = queue.Queue()
+        self._timer = None
+        self._headless = False
+
+        # Register for cleanup on Python exit
+        _active_servers.append(self)
+        global _atexit_registered
+        if not _atexit_registered:
+            atexit.register(_cleanup_all_servers)
+            _atexit_registered = True
 
     @property
     def is_running(self):
         return self.running
 
     def start(self):
-        """Start the TCP server in a daemon thread."""
+        """Start the TCP server and queue processor."""
         if self.running:
             return
 
+        self.running = True
+
+        # Start queue processor (QTimer in GUI mode, thread in headless)
+        self._start_queue_processor()
+
+        # Start TCP server
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server_socket.bind((self.host, self.port))
         self.server_socket.listen(5)
         self.server_socket.settimeout(1.0)
 
-        self.running = True
         self.thread = threading.Thread(target=self._accept_loop, daemon=True)
         self.thread.start()
+
+        FreeCAD.Console.PrintMessage(
+            "[HermesFreeCADMCP] Bridge started on port %d\n" % self.port
+        )
 
     def stop(self):
         """Stop the TCP server."""
         self.running = False
+
+        # Stop queue processor timer
+        if self._timer:
+            with contextlib.suppress(Exception):
+                self._timer.stop()
+                self._timer.timeout.disconnect()
+                self._timer.deleteLater()
+            self._timer = None
+
         if self.server_socket:
             try:
                 self.server_socket.close()
             except OSError:
                 pass
+            self.server_socket = None
+
+        FreeCAD.Console.PrintMessage("[HermesFreeCADMCP] Bridge stopped\n")
+
+    def _cleanup_for_exit(self):
+        """Clean up server resources during Python exit (atexit handler).
+
+        Uses shiboken.delete() for immediate destruction of QTimer objects
+        to prevent GC crashes during Py_FinalizeEx.
+        """
+        self.running = False
+
+        # Get shiboken delete function
+        shiboken_delete = None
+        with contextlib.suppress(ImportError):
+            import shiboken6
+            shiboken_delete = shiboken6.delete
+        if shiboken_delete is None:
+            with contextlib.suppress(ImportError):
+                import shiboken2
+                shiboken_delete = shiboken2.delete
+
+        # Stop queue processor timer
+        if self._timer:
+            timer = self._timer
+            self._timer = None
+            with contextlib.suppress(Exception):
+                timer.stop()
+            with contextlib.suppress(Exception):
+                timer.timeout.disconnect()
+            if shiboken_delete is not None:
+                with contextlib.suppress(Exception):
+                    shiboken_delete(timer)
+
+        # Close socket
+        if self.server_socket:
+            with contextlib.suppress(Exception):
+                self.server_socket.close()
             self.server_socket = None
 
     def get_status(self):
@@ -142,6 +193,101 @@ class MCPBridgeServer:
                 time.ctime(self.last_command_time) if self.last_command_time else "never",
             )
         )
+
+    # ──────────────────────────────────────────────
+    # Queue-based Thread Safety
+    # ──────────────────────────────────────────────
+
+    def _start_queue_processor(self):
+        """Start the queue processor on the main GUI thread.
+
+        In GUI mode, creates a QTimer that fires every QUEUE_POLL_INTERVAL_MS
+        to process the request queue on the main thread.
+        In headless mode, a daemon background thread polls the queue instead.
+        """
+        if FreeCAD.GuiUp:
+            try:
+                timer = QtCore.QTimer()
+                timer.timeout.connect(self._process_queue)
+                timer.start(QUEUE_POLL_INTERVAL_MS)
+                self._timer = timer
+                return
+            except Exception:
+                pass
+
+        # Headless mode: use a background thread
+        self._headless = True
+
+        def _queue_loop():
+            while self.running:
+                self._process_queue()
+                time.sleep(QUEUE_POLL_INTERVAL_MS / 1000.0)
+
+        self._queue_thread = threading.Thread(
+            target=_queue_loop, daemon=True, name="MCP-QueueProcessor"
+        )
+        self._queue_thread.start()
+
+    def _process_queue(self):
+        """Process pending execution requests on the main thread."""
+        while not self._request_queue.empty():
+            try:
+                request = self._request_queue.get_nowait()
+                result = self._execute_sync(request)
+                request.result = result
+                request.completed.set()
+            except queue.Empty:
+                break
+            except Exception as e:
+                FreeCAD.Console.PrintError(
+                    "[HermesFreeCADMCP] Queue error: %s\n" % str(e)
+                )
+
+    def _execute_sync(self, request):
+        """Execute a function call synchronously (main thread only)."""
+        try:
+            result = request.func(*request.args, **request.kwargs)
+            return {"result": result}
+        except Exception as e:
+            return {
+                "error": "%s: %s" % (type(e).__name__, str(e)),
+                "traceback": traceback.format_exc(),
+            }
+
+    def _execute_on_main(self, func, args, kwargs, timeout=60.0):
+        """Execute a function on the main thread via the queue system.
+
+        Args:
+            func: Callable to execute on the main thread.
+            args: Positional arguments.
+            kwargs: Keyword arguments.
+            timeout: Execution timeout in seconds.
+
+        Returns:
+            The result of the function call.
+
+        Raises:
+            TimeoutError: If execution exceeds the timeout.
+            RuntimeError: If the function raised an exception.
+        """
+        req_id = next(_req_counter)
+        request = ExecutionRequest(func, args, kwargs, req_id, timeout)
+        self._request_queue.put(request)
+
+        if request.completed.wait(timeout=timeout):
+            if request.result is None:
+                raise RuntimeError("No result returned")
+            if "error" in request.result:
+                raise RuntimeError(request.result["error"])
+            return request.result.get("result", request.result)
+        else:
+            raise TimeoutError(
+                "FreeCAD command timed out after %.0fs" % timeout
+            )
+
+    # ──────────────────────────────────────────────
+    # TCP Server
+    # ──────────────────────────────────────────────
 
     def _accept_loop(self):
         """Accept incoming connections and spawn handler threads."""
@@ -280,13 +426,23 @@ class MCPBridgeServer:
             "solve_sketch": self._solve_sketch,
             "pad_sketch": self._pad_sketch,
             "extrude_sketch": self._extrude_sketch,
+            # PartDesign tools
+            "create_body": self._create_body,
+            "pocket_sketch": self._pocket_sketch,
+            "revolution_sketch": self._revolution_sketch,
+            "groove_sketch": self._groove_sketch,
+            "partdesign_fillet": self._partdesign_fillet,
+            "partdesign_chamfer": self._partdesign_chamfer,
+            # Export
             "export_stl": self._export_stl,
             "export_step": self._export_step,
             "export_3mf": self._export_3mf,
             "export_svg": self._export_svg,
+            # View
             "fit_all": self._fit_all,
             "set_view": self._set_view,
             "screenshot": self._screenshot,
+            # Misc
             "run_python": self._run_python,
             "get_selection": self._get_selection,
             "ping": self._ping,
@@ -301,15 +457,8 @@ class MCPBridgeServer:
         handler = handlers[tool]
         timeout = 120.0 if tool == "run_python" else 60.0
 
-        # Execute on main thread
-        req_id = next(_req_counter)
-        self._dispatcher.execute_on_main(handler, (), args, req_id)
-        result = self._dispatcher.get_result(req_id, timeout=timeout)
-
-        if "error" in result:
-            raise RuntimeError(result["error"])
-
-        return result.get("result", result)
+        # Execute on main thread via queue
+        return self._execute_on_main(handler, (), args, timeout=timeout)
 
     # ──────────────────────────────────────────────
     # Handlers (all execute on main thread)
@@ -639,9 +788,42 @@ class MCPBridgeServer:
         doc.recompute()
         return self._object_result(result)
 
-    def _create_sketch(self, name=None, plane="XY"):
+    def _create_sketch(self, name=None, plane="XY", body_name=None):
+        """Create a new sketch, optionally attached to a PartDesign Body."""
         doc = self._ensure_doc()
-        sketch = doc.addObject("Sketcher::SketchObject", name or "Sketch")
+        sketch_name = name or "Sketch"
+
+        if body_name:
+            body = doc.getObject(body_name)
+            if not body:
+                raise ValueError("Body not found: %s" % body_name)
+            sketch = body.newObject("Sketcher::SketchObject", sketch_name)
+            # Attach to body origin plane
+            if plane in ("XY_Plane", "XZ_Plane", "YZ_Plane"):
+                plane_obj = body.Origin.getObject(plane)
+                if plane_obj:
+                    sketch.AttachmentSupport = [(plane_obj, "")]
+                    sketch.MapMode = "FlatFace"
+            elif plane.startswith("Face"):
+                sketch.AttachmentSupport = [(body, plane)]
+                sketch.MapMode = "FlatFace"
+        else:
+            sketch = doc.addObject("Sketcher::SketchObject", sketch_name)
+            if plane == "XY":
+                sketch.Placement = FreeCAD.Placement(
+                    FreeCAD.Vector(0, 0, 0), FreeCAD.Rotation(0, 0, 0, 1)
+                )
+            elif plane == "XZ":
+                sketch.Placement = FreeCAD.Placement(
+                    FreeCAD.Vector(0, 0, 0),
+                    FreeCAD.Rotation(FreeCAD.Vector(1, 0, 0), 90),
+                )
+            elif plane == "YZ":
+                sketch.Placement = FreeCAD.Placement(
+                    FreeCAD.Vector(0, 0, 0),
+                    FreeCAD.Rotation(FreeCAD.Vector(0, 1, 0), 90),
+                )
+
         sketch.Label = name or "Sketch %d" % (len(doc.Objects))
         doc.recompute()
         return self._object_result(sketch)
@@ -651,8 +833,7 @@ class MCPBridgeServer:
         sketch = doc.getObject(sketch_name)
         if not sketch:
             raise ValueError("Sketch not found: %s" % sketch_name)
-        import Sketcher
-        sketch.addGeometry(
+        idx = sketch.addGeometry(
             Part.LineSegment(
                 FreeCAD.Vector(x1, y1, 0),
                 FreeCAD.Vector(x2, y2, 0),
@@ -660,15 +841,14 @@ class MCPBridgeServer:
             False,
         )
         doc.recompute()
-        return {"added": "line", "sketch": sketch_name}
+        return {"added": "line", "index": idx, "sketch": sketch_name}
 
     def _add_sketch_circle(self, sketch_name, cx=0, cy=0, radius=5):
         doc = self._ensure_doc()
         sketch = doc.getObject(sketch_name)
         if not sketch:
             raise ValueError("Sketch not found: %s" % sketch_name)
-        import Sketcher
-        sketch.addGeometry(
+        idx = sketch.addGeometry(
             Part.Circle(
                 FreeCAD.Vector(cx, cy, 0),
                 FreeCAD.Vector(0, 0, 1),
@@ -677,15 +857,14 @@ class MCPBridgeServer:
             False,
         )
         doc.recompute()
-        return {"added": "circle", "sketch": sketch_name}
+        return {"added": "circle", "index": idx, "sketch": sketch_name}
 
     def _add_sketch_arc(self, sketch_name, x1, y1, x2, y2, xm, ym):
         doc = self._ensure_doc()
         sketch = doc.getObject(sketch_name)
         if not sketch:
             raise ValueError("Sketch not found: %s" % sketch_name)
-        import Sketcher
-        sketch.addGeometry(
+        idx = sketch.addGeometry(
             Part.Arc(
                 FreeCAD.Vector(x1, y1, 0),
                 FreeCAD.Vector(xm, ym, 0),
@@ -694,7 +873,7 @@ class MCPBridgeServer:
             False,
         )
         doc.recompute()
-        return {"added": "arc", "sketch": sketch_name}
+        return {"added": "arc", "index": idx, "sketch": sketch_name}
 
     # ── Constraint types (name → Sketcher.Constraint enum) ──
     _CONSTRAINT_MAP = {
@@ -747,7 +926,6 @@ class MCPBridgeServer:
         geo_count = sketch.GeometryCount
 
         if ctype.lower() in ("coincident", "point_on_line"):
-            # Point-to-point: p1=[geoId, posId], p2=[geoId, posId]
             if not p1 or not p2:
                 raise ValueError(
                     "%s requires p1 and p2 as [geoId, posId] pairs" % ctype
@@ -763,26 +941,22 @@ class MCPBridgeServer:
             )
 
         elif ctype.lower() in ("distance", "distance_x", "distance_y"):
-            # Distance: p1=[geoId,posId], optional p2=[geoId,posId]
             if value is None:
                 raise ValueError("%s requires a value" % ctype)
             if not p1:
                 raise ValueError("%s requires p1 as [geoId, posId]" % ctype)
             g1, pos1v = p1
             if p2:
-                # Two-point distance
                 g2, pos2v = p2
                 c = Sketcher.Constraint(
                     type_name, int(g1), int(pos1v), int(g2), int(pos2v), float(value)
                 )
             else:
-                # Single-point distance from origin
                 c = Sketcher.Constraint(
                     type_name, int(g1), int(pos1v), float(value)
                 )
 
         elif ctype.lower() in ("radius", "diameter"):
-            # Single geometry: geo1
             if value is None:
                 raise ValueError("%s requires a value" % ctype)
             if geo1 is None:
@@ -792,7 +966,6 @@ class MCPBridgeServer:
             c = Sketcher.Constraint(type_name, int(geo1), float(value))
 
         elif ctype.lower() == "angle":
-            # Angle between two lines: geo1, geo2
             if value is None:
                 raise ValueError("angle requires a value (degrees)")
             if geo1 is None or geo2 is None:
@@ -800,7 +973,6 @@ class MCPBridgeServer:
             c = Sketcher.Constraint(type_name, int(geo1), int(geo2), float(value))
 
         elif ctype.lower() in ("horizontal", "vertical", "fixed", "block"):
-            # Single geometry: geo1
             if geo1 is None:
                 raise ValueError("%s requires geo1" % ctype)
             if geo1 >= geo_count:
@@ -808,7 +980,6 @@ class MCPBridgeServer:
             c = Sketcher.Constraint(type_name, int(geo1))
 
         elif ctype.lower() in ("parallel", "perpendicular", "tangent", "equal"):
-            # Two geometries: geo1, geo2
             if geo1 is None or geo2 is None:
                 raise ValueError("%s requires geo1 and geo2" % ctype)
             if geo1 >= geo_count or geo2 >= geo_count:
@@ -816,7 +987,6 @@ class MCPBridgeServer:
             c = Sketcher.Constraint(type_name, int(geo1), int(geo2))
 
         elif ctype.lower() == "symmetric":
-            # p1, p2, and geo1 (axis of symmetry)
             if not p1 or not p2 or geo1 is None:
                 raise ValueError(
                     "symmetric requires p1, p2 as [geoId,posId] and geo1 (axis)"
@@ -833,27 +1003,55 @@ class MCPBridgeServer:
         sketch.addConstraint(c)
         doc.recompute()
 
-        # Report constraint status
-        dof = sketch.solve()
+        # Report constraint status with proper DoF calculation
         info = self._sketch_status(sketch)
         info["constraint_added"] = ctype
         info["constraint_count"] = len(sketch.Constraints)
         return info
 
     def _sketch_status(self, sketch):
-        """Return DoF and constraint status for a sketch."""
-        sketch.solve()
-        geo_count = sketch.GeometryCount
-        con_count = len(sketch.Constraints)
-        
-        # Use FreeCAD's built-in DoF calculation if available
-        # sketch.solve() returns 0 on success, but we need actual DoF
-        # The most reliable way: check if sketch is fully constrained
-        # by seeing if all geometry is fixed
-        
-        # Compute DoF: each line = 4 DoF, each circle = 3 DoF, each arc = 5 DoF
+        """Return DoF and constraint status for a sketch.
+
+        Uses sketch.solve() which in FreeCAD 1.x returns the number of
+        remaining degrees of freedom (0 = fully constrained).
+        Falls back to manual calculation if solve() doesn't return DoF.
+        """
+        # Try the solver first — in FreeCAD 1.x, solve() returns DoF count
+        solve_result = sketch.solve()
+
+        # Determine DoF from solver result
+        if isinstance(solve_result, int) and solve_result >= 0:
+            dof = solve_result
+        else:
+            # Fallback: manual calculation
+            dof = self._calculate_dof_manual(sketch)
+
+        fully_constrained = (dof == 0)
+        return {
+            "geometry_count": sketch.GeometryCount,
+            "constraint_count": len(sketch.Constraints),
+            "dof": dof,
+            "fully_constrained": fully_constrained,
+            "status": "FULLY CONSTRAINED (green)" if fully_constrained
+                      else "UNDER-CONSTRAINED (blue, %d DoF remaining)" % dof,
+        }
+
+    def _calculate_dof_manual(self, sketch):
+        """Fallback manual DoF calculation when solve() doesn't return DoF.
+
+        Each geometry type has a known number of DoF:
+        - Line: 4 (2 points × 2 coords)
+        - Circle: 3 (center x,y + radius)
+        - Arc: 5 (center x,y + radius + start angle + end angle)
+        - Ellipse: 7
+        - Spline: variable
+
+        Each constraint removes 1-2 DoF depending on type.
+        """
+        import Sketcher
+
         total_dof = 0
-        for i in range(geo_count):
+        for i in range(sketch.GeometryCount):
             try:
                 g = sketch.getGeometry(i)
                 gtype = type(g).__name__
@@ -863,50 +1061,62 @@ class MCPBridgeServer:
                     total_dof += 3
                 elif gtype in ("ArcOfCircle", "Arc"):
                     total_dof += 5
+                elif gtype == "Ellipse":
+                    total_dof += 7
                 else:
                     total_dof += 4
             except Exception:
                 total_dof += 4
 
         # Subtract DoF removed by constraints
-        # Use the constraint's Type attribute (integer enum in FreeCAD)
-        # Coincident=0, Block=1, Distance=2, ... 
-        # We'll use a mapping based on the constraint type name
+        # Constraint type → DoF removed
+        _DOF_REMOVED = {
+            "Coincident": 2,
+            "Block": 4,
+            "Distance": 1,
+            "DistanceX": 1,
+            "DistanceY": 1,
+            "Horizontal": 1,
+            "Vertical": 1,
+            "Parallel": 1,
+            "Perpendicular": 1,
+            "PointOnLine": 1,
+            "Tangent": 1,
+            "Equal": 1,
+            "Symmetric": 2,
+            "Angle": 1,
+            "Radius": 1,
+            "Diameter": 1,
+            "Fixed": 4,
+        }
+
         removed = 0
         for c in sketch.Constraints:
-            # Get the constraint type as a string
-            # In FreeCAD, c.Type is an integer enum
-            # We can use Sketcher.ConstraintType to get the name
+            # Get constraint type name
             try:
-                # Try to get the type name from the constraint
-                if hasattr(c, "Type"):
-                    type_val = c.Type
-                    # Type is an integer - map to known values
-                    # 0=Coincident, 1=Block, 2=Distance, 3=Horizontal, 
-                    # 4=Vertical, 5=Parallel, 6=Perpendicular, 7=PointOnLine,
-                    # 8=Tangent, 9=Equal, 10=Symmetric, 11=Angle, 12=Radius,
-                    # 13=Diameter, 14=DistanceX, 15=DistanceY, 16=Fixed
-                    if type_val == 0:  # Coincident
-                        removed += 2
-                    elif type_val in (1, 16):  # Block, Fixed
-                        removed += 4  # approximates fixing a line
-                    else:
-                        removed += 1
-                else:
-                    removed += 1
+                # In FreeCAD 1.x, constraint.Type is an integer enum
+                type_val = c.Type
+                # Try to get the name from the enum
+                ctype_name = None
+                try:
+                    # Find the name that matches the integer value
+                    for name in dir(Sketcher.Constraint.Type):
+                        if not name.startswith("_"):
+                            try:
+                                if Sketcher.Constraint.Type[name] == type_val:
+                                    ctype_name = name
+                                    break
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                if ctype_name is None:
+                    ctype_name = "Unknown"
+                removed += _DOF_REMOVED.get(ctype_name, 1)
             except Exception:
                 removed += 1
 
-        dof = max(0, total_dof - removed)
-        fully_constrained = (dof == 0)
-        return {
-            "geometry_count": geo_count,
-            "constraint_count": con_count,
-            "dof": dof,
-            "fully_constrained": fully_constrained,
-            "status": "FULLY CONSTRAINED (green)" if fully_constrained
-                      else "UNDER-CONSTRAINED (blue, %d DoF remaining)" % dof,
-        }
+        return max(0, total_dof - removed)
 
     def _get_sketch_info(self, sketch_name):
         """Get detailed info about a sketch: geometry, constraints, DoF."""
@@ -948,20 +1158,32 @@ class MCPBridgeServer:
         return self._sketch_status(sketch)
 
     def _pad_sketch(self, sketch_name, length=10, name=None):
+        """Create a PartDesign Pad from a sketch (if in a Body) or Part extrusion."""
         doc = self._ensure_doc()
         sketch = doc.getObject(sketch_name)
         if not sketch:
             raise ValueError("Sketch not found: %s" % sketch_name)
-        wire = sketch.Shape.Wires
-        if not wire:
-            raise ValueError("Sketch has no wires to extrude")
-        face = Part.Face(wire[0])
-        extruded = face.extrude(FreeCAD.Vector(0, 0, length))
-        result = doc.addObject("Part::Feature", name or "Pad")
-        result.Shape = extruded
-        result.Label = name or "Pad %s" % sketch_name
-        doc.recompute()
-        return self._object_result(result)
+
+        # Check if sketch is in a PartDesign Body
+        body = self._find_body(sketch)
+        if body:
+            pad = body.newObject("PartDesign::Pad", name or "Pad")
+            pad.Profile = sketch
+            pad.Length = length
+            doc.recompute()
+            return self._object_result(pad)
+        else:
+            # Fallback: Part extrusion
+            wire = sketch.Shape.Wires
+            if not wire:
+                raise ValueError("Sketch has no wires to extrude")
+            face = Part.Face(wire[0])
+            extruded = face.extrude(FreeCAD.Vector(0, 0, length))
+            result = doc.addObject("Part::Feature", name or "Pad")
+            result.Shape = extruded
+            result.Label = name or "Pad %s" % sketch_name
+            doc.recompute()
+            return self._object_result(result)
 
     def _extrude_sketch(self, sketch_name, length=10, direction=None, name=None):
         doc = self._ensure_doc()
@@ -982,6 +1204,148 @@ class MCPBridgeServer:
         result.Label = name or "Extrude %s" % sketch_name
         doc.recompute()
         return self._object_result(result)
+
+    # ──────────────────────────────────────────────
+    # PartDesign Tools
+    # ──────────────────────────────────────────────
+
+    def _create_body(self, name=None):
+        """Create a new PartDesign Body."""
+        doc = self._ensure_doc()
+        body = doc.addObject("PartDesign::Body", name or "Body")
+        body.Label = name or "Body %d" % (len(doc.Objects))
+        doc.recompute()
+        return {
+            "name": body.Name,
+            "label": body.Label,
+            "type": body.TypeId,
+        }
+
+    def _pocket_sketch(self, sketch_name, length=10, pocket_type="Length", name=None):
+        """Create a PartDesign Pocket (cut extrusion) from a sketch."""
+        doc = self._ensure_doc()
+        sketch = doc.getObject(sketch_name)
+        if not sketch:
+            raise ValueError("Sketch not found: %s" % sketch_name)
+
+        body = self._find_body(sketch)
+        if not body:
+            raise ValueError("Sketch must be inside a PartDesign Body for Pocket")
+
+        pocket = body.newObject("PartDesign::Pocket", name or "Pocket")
+        pocket.Profile = sketch
+        pocket.Length = length
+        pocket.Type = pocket_type
+        doc.recompute()
+        return self._object_result(pocket)
+
+    def _revolution_sketch(self, sketch_name, angle=360.0, axis="Base_Y", name=None):
+        """Create a PartDesign Revolution from a sketch."""
+        doc = self._ensure_doc()
+        sketch = doc.getObject(sketch_name)
+        if not sketch:
+            raise ValueError("Sketch not found: %s" % sketch_name)
+
+        body = self._find_body(sketch)
+        if not body:
+            raise ValueError("Sketch must be inside a PartDesign Body for Revolution")
+
+        rev = body.newObject("PartDesign::Revolution", name or "Revolution")
+        rev.Profile = sketch
+        rev.Angle = angle
+
+        # Set axis reference
+        if axis.startswith("Base_"):
+            axis_ref = axis.replace("Base_", "")
+            axis_obj = body.Origin.getObject("%s_Axis" % axis_ref)
+            if axis_obj:
+                rev.ReferenceAxis = (axis_obj, [""])
+        elif axis == "Sketch_V":
+            rev.ReferenceAxis = (sketch, ["V_Axis"])
+        elif axis == "Sketch_H":
+            rev.ReferenceAxis = (sketch, ["H_Axis"])
+
+        doc.recompute()
+        return self._object_result(rev)
+
+    def _groove_sketch(self, sketch_name, angle=360.0, axis="Base_Y", name=None):
+        """Create a PartDesign Groove (subtractive revolution) from a sketch."""
+        doc = self._ensure_doc()
+        sketch = doc.getObject(sketch_name)
+        if not sketch:
+            raise ValueError("Sketch not found: %s" % sketch_name)
+
+        body = self._find_body(sketch)
+        if not body:
+            raise ValueError("Sketch must be inside a PartDesign Body for Groove")
+
+        groove = body.newObject("PartDesign::Groove", name or "Groove")
+        groove.Profile = sketch
+        groove.Angle = angle
+
+        if axis.startswith("Base_"):
+            axis_ref = axis.replace("Base_", "")
+            axis_obj = body.Origin.getObject("%s_Axis" % axis_ref)
+            if axis_obj:
+                groove.ReferenceAxis = (axis_obj, [""])
+
+        doc.recompute()
+        return self._object_result(groove)
+
+    def _partdesign_fillet(self, object_name, radius=1.0, edges=None, name=None):
+        """Add a PartDesign Fillet to an object in a Body."""
+        doc = self._ensure_doc()
+        obj = doc.getObject(object_name)
+        if not obj:
+            raise ValueError("Object not found: %s" % object_name)
+
+        body = self._find_body(obj)
+        if not body:
+            raise ValueError("Object must be inside a PartDesign Body")
+
+        fillet = body.newObject("PartDesign::Fillet", name or "Fillet")
+        if edges:
+            fillet.Base = (obj, edges)
+        else:
+            fillet.Base = (obj, ["Edge%d" % (i + 1) for i in range(len(obj.Shape.Edges))])
+        fillet.Radius = radius
+        doc.recompute()
+        return self._object_result(fillet)
+
+    def _partdesign_chamfer(self, object_name, size=1.0, edges=None, name=None):
+        """Add a PartDesign Chamfer to an object in a Body."""
+        doc = self._ensure_doc()
+        obj = doc.getObject(object_name)
+        if not obj:
+            raise ValueError("Object not found: %s" % object_name)
+
+        body = self._find_body(obj)
+        if not body:
+            raise ValueError("Object must be inside a PartDesign Body")
+
+        chamfer = body.newObject("PartDesign::Chamfer", name or "Chamfer")
+        if edges:
+            chamfer.Base = (obj, edges)
+        else:
+            chamfer.Base = (obj, ["Edge%d" % (i + 1) for i in range(len(obj.Shape.Edges))])
+        chamfer.Size = size
+        doc.recompute()
+        return self._object_result(chamfer)
+
+    def _find_body(self, obj):
+        """Find the PartDesign Body containing the given object."""
+        doc = FreeCAD.ActiveDocument
+        if not doc:
+            return None
+        for o in doc.Objects:
+            if o.TypeId == "PartDesign::Body":
+                if hasattr(o, "Group") and obj in o.Group:
+                    return o
+        return None
+
+    # ──────────────────────────────────────────────
+    # Export
+    # ──────────────────────────────────────────────
 
     def _export_stl(self, path, objects=None, tolerance=0.1):
         doc = self._ensure_doc()
@@ -1066,6 +1430,10 @@ class MCPBridgeServer:
         TechDrawGui.exportPageAsSvg(page, path)
         return {"exported": path, "format": "SVG"}
 
+    # ──────────────────────────────────────────────
+    # View
+    # ──────────────────────────────────────────────
+
     def _fit_all(self):
         import FreeCADGui as Gui
         Gui.SendMsgToActiveView("ViewFit")
@@ -1100,6 +1468,10 @@ class MCPBridgeServer:
             path = os.path.join(tempfile.gettempdir(), "freecad_screenshot.png")
         view.saveImage(path, width, height, "White")
         return {"screenshot": path, "width": width, "height": height}
+
+    # ──────────────────────────────────────────────
+    # Misc
+    # ──────────────────────────────────────────────
 
     def _run_python(self, code, timeout=30):
         namespace = {
