@@ -845,8 +845,13 @@ class MCPBridgeServer:
         sketch.solve()
         geo_count = sketch.GeometryCount
         con_count = len(sketch.Constraints)
-        # Compute DoF: each line = 4 DoF, each circle = 3 DoF
-        # Each constraint removes DoF (most remove 1, coincident removes 2, fixed removes all)
+        
+        # Use FreeCAD's built-in DoF calculation if available
+        # sketch.solve() returns 0 on success, but we need actual DoF
+        # The most reliable way: check if sketch is fully constrained
+        # by seeing if all geometry is fixed
+        
+        # Compute DoF: each line = 4 DoF, each circle = 3 DoF, each arc = 5 DoF
         total_dof = 0
         for i in range(geo_count):
             try:
@@ -859,33 +864,38 @@ class MCPBridgeServer:
                 elif gtype in ("ArcOfCircle", "Arc"):
                     total_dof += 5
                 else:
-                    total_dof += 4  # default
+                    total_dof += 4
             except Exception:
                 total_dof += 4
 
         # Subtract DoF removed by constraints
+        # Use the constraint's Type attribute (integer enum in FreeCAD)
+        # Coincident=0, Block=1, Distance=2, ... 
+        # We'll use a mapping based on the constraint type name
         removed = 0
         for c in sketch.Constraints:
-            ctype = str(getattr(c, "Type", ""))
-            if ctype in ("Coincident", "PointOnLine"):
-                removed += 2
-            elif ctype in ("Fixed", "Block"):
-                # Fixed removes all DoF of the geometry
-                try:
-                    g = sketch.getGeometry(c.First)
-                    gtype = type(g).__name__
-                    if gtype == "LineSegment":
-                        removed += 4
-                    elif gtype == "Circle":
-                        removed += 3
+            # Get the constraint type as a string
+            # In FreeCAD, c.Type is an integer enum
+            # We can use Sketcher.ConstraintType to get the name
+            try:
+                # Try to get the type name from the constraint
+                if hasattr(c, "Type"):
+                    type_val = c.Type
+                    # Type is an integer - map to known values
+                    # 0=Coincident, 1=Block, 2=Distance, 3=Horizontal, 
+                    # 4=Vertical, 5=Parallel, 6=Perpendicular, 7=PointOnLine,
+                    # 8=Tangent, 9=Equal, 10=Symmetric, 11=Angle, 12=Radius,
+                    # 13=Diameter, 14=DistanceX, 15=DistanceY, 16=Fixed
+                    if type_val == 0:  # Coincident
+                        removed += 2
+                    elif type_val in (1, 16):  # Block, Fixed
+                        removed += 4  # approximates fixing a line
                     else:
-                        removed += 4
-                except Exception:
-                    removed += 4
-            elif ctype in ("Horizontal", "Vertical"):
+                        removed += 1
+                else:
+                    removed += 1
+            except Exception:
                 removed += 1
-            else:
-                removed += 1  # most constraints remove 1 DoF
 
         dof = max(0, total_dof - removed)
         fully_constrained = (dof == 0)
