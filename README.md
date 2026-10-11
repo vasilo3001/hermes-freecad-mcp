@@ -27,16 +27,17 @@ FreeCAD Addon  (runs inside FreeCAD GUI)
 ### Mode 2: Homeserver (HTTP) — recommended for multi-agent
 
 Persistent MCP server in Docker on your homeserver, reachable by multiple
-Hermes agents over LAN or Tailscale:
+Hermes agents over LAN or Tailscale. FreeCAD runs on a separate machine
+(your desktop):
 
 ```
 Hermes Agent (any machine on network)
   │ HTTP (streamable, JSON-RPC 2.0)
   ▼
 mcp_server.py --http  (Docker container on homeserver)
-  │ TCP host.docker.internal:9876
+  │ TCP <desktop-ip>:9876
   ▼
-FreeCAD Addon  (runs inside FreeCAD GUI on homeserver)
+FreeCAD Addon  (runs inside FreeCAD GUI on desktop)
 ```
 
 ## Requirements
@@ -123,28 +124,21 @@ mcp_servers:
 ```yaml
 services:
   freecadmcp:
-    image: freecad-mcp:latest
+    image: vasilo30001/freecad-mcp:latest
     container_name: freecadmcp
     restart: unless-stopped
     ports:
       - "3111:8000"
     environment:
-      - FREECAD_HOST=host.docker.internal
+      # FreeCAD bridge on the desktop
+      - FREECAD_HOST=192.168.1.177
       - FREECAD_PORT=9876
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    networks:
-      - homeserver_homeserver-net
-networks:
-  homeserver_homeserver-net:
-    external: true
 ```
 
-Build the image first:
-
-```bash
-docker build -t freecad-mcp .
-```
+> **Note:** The image is pre-built and pushed to Docker Hub
+> (`vasilo30001/freecad-mcp:latest`). No build step needed — Portainer
+> pulls it directly. Update by pushing a new tag and bumping the image
+> reference in the stack.
 
 ### 5. Start FreeCAD and Activate the Bridge
 
@@ -159,7 +153,7 @@ docker build -t freecad-mcp .
 
 Restart Hermes so it picks up the new MCP server. On startup it will:
 - Connect to `mcp_server.py` (stdio or HTTP)
-- Discover all 42 FreeCAD tools
+- Discover all 48 FreeCAD tools
 - Register them as `mcp_freecad_*` tools
 
 ## Usage
@@ -340,7 +334,7 @@ freecadMCP vibecoding/
 | Port 9876 already in use | Change `MCP_BRIDGE_PORT` in `mcp_bridge.py` and `FREECAD_PORT` env var. |
 | Commands time out | Complex geometry can take time. Increase `timeout` in config. |
 | HTTP mode: connection refused | Check Docker container is running: `docker ps`. Check port mapping. |
-| HTTP mode: can't reach FreeCAD | Check `FREECAD_HOST` env var. On Linux, `extra_hosts` must include `host.docker.internal:host-gateway`. |
+| HTTP mode: can't reach FreeCAD | Check `FREECAD_HOST` env var points to the machine running FreeCAD. If FreeCAD is on the same machine as Docker, use `host.docker.internal` with `extra_hosts: ["host.docker.internal:host-gateway"]`. If on a different machine, use its LAN IP. |
 
 ## Roadmap
 
@@ -348,7 +342,7 @@ freecadMCP vibecoding/
 - [x] Sketcher constraint solving (coincident, distance, horizontal, vertical, etc.)
 - [x] PartDesign workbench integration (Body, Pad, Pocket, Revolution, Groove, Fillet, Chamfer)
 - [x] Queue-based thread safety (QTimer polling, no QMetaObject.invokeMethod)
-- [x] Proper DoF calculation via sketch.solve()
+- [x] Proper DoF calculation via `sketch.DoF` property (FreeCAD 1.x)
 - [ ] TechDraw automated drawings
 - [ ] FEM analysis hooks
 - [ ] Multi-document support
