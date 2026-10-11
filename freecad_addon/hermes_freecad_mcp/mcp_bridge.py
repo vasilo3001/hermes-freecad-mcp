@@ -1012,17 +1012,14 @@ class MCPBridgeServer:
     def _sketch_status(self, sketch):
         """Return DoF and constraint status for a sketch.
 
-        Uses sketch.solve() which in FreeCAD 1.x returns the number of
-        remaining degrees of freedom (0 = fully constrained).
-        Falls back to manual calculation if solve() doesn't return DoF.
+        Uses the sketch.DoF property (FreeCAD 1.x) which gives the exact
+        remaining degrees of freedom after the last solve.
+        Falls back to manual calculation if DoF property is unavailable.
         """
-        # Try the solver first — in FreeCAD 1.x, solve() returns DoF count
-        solve_result = sketch.solve()
-
-        # Determine DoF from solver result
-        if isinstance(solve_result, int) and solve_result >= 0:
-            dof = solve_result
-        else:
+        # Primary: sketch.DoF property (FreeCAD 1.x)
+        try:
+            dof = int(sketch.DoF)
+        except (AttributeError, TypeError):
             # Fallback: manual calculation
             dof = self._calculate_dof_manual(sketch)
 
@@ -1053,7 +1050,11 @@ class MCPBridgeServer:
         total_dof = 0
         for i in range(sketch.GeometryCount):
             try:
-                g = sketch.getGeometry(i)
+                # FreeCAD 1.x: use Geometry property
+                try:
+                    g = sketch.Geometry[i]
+                except Exception:
+                    g = sketch.getGeometry(i)
                 gtype = type(g).__name__
                 if gtype == "LineSegment":
                     total_dof += 4
@@ -1092,26 +1093,9 @@ class MCPBridgeServer:
 
         removed = 0
         for c in sketch.Constraints:
-            # Get constraint type name
+            # Get constraint type name (string in FreeCAD 1.x)
             try:
-                # In FreeCAD 1.x, constraint.Type is an integer enum
-                type_val = c.Type
-                # Try to get the name from the enum
-                ctype_name = None
-                try:
-                    # Find the name that matches the integer value
-                    for name in dir(Sketcher.Constraint.Type):
-                        if not name.startswith("_"):
-                            try:
-                                if Sketcher.Constraint.Type[name] == type_val:
-                                    ctype_name = name
-                                    break
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-                if ctype_name is None:
-                    ctype_name = "Unknown"
+                ctype_name = str(c.Type)
                 removed += _DOF_REMOVED.get(ctype_name, 1)
             except Exception:
                 removed += 1
@@ -1125,21 +1109,24 @@ class MCPBridgeServer:
         if not sketch:
             raise ValueError("Sketch not found: %s" % sketch_name)
 
-        import Sketcher
-
         geo_types = []
         for i in range(sketch.GeometryCount):
             try:
-                g = sketch.getGeometry(i)
+                # FreeCAD 1.x: use Geometry property (list)
+                g = sketch.Geometry[i]
                 geo_types.append(type(g).__name__)
             except Exception:
-                geo_types.append("unknown")
+                try:
+                    # Fallback: getGeometry() (older API)
+                    g = sketch.getGeometry(i)
+                    geo_types.append(type(g).__name__)
+                except Exception:
+                    geo_types.append("unknown")
 
         constraints = []
         for c in sketch.Constraints:
-            ctype = type(c).__name__
             constraints.append({
-                "type": ctype,
+                "type": str(c.Type),
                 "value": getattr(c, "Value", None),
             })
 
